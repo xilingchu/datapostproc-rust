@@ -1,0 +1,9 @@
+[package]
+name = "datapostproc-rust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+blosc-src = '0.3.6'
+ndarray = '0.16.1'
+hdf5 = { package = "hdf5-metno", version = "0.10.1", features = ['blosc'] }
