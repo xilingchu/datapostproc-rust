@@ -103,24 +103,23 @@ impl Block {
         Ok(self)
     }
 
-    fn dim(&self) -> usize {
-        let mut count:usize = 0;
-        for block_item in &self.data{
-            if block_item.is_some() {
-                count += 1
-            }
+    fn dim(&self) -> Result<usize> {
+        if !self.validated {
+            return Err("Block must be validated before use".into());
         }
-        count
+        Ok(self.data.iter().count())
     }
 
-    fn size(&self) -> Vec<usize> {
-        let mut size = Vec::new();
-        for block_item in &self.0{
-            if let Some(bx) = &block_item {
-                size.push(bx.0[2] * bx.0[3]);
-            }
+    fn size(&self) -> Result<Vec<usize>> {
+        if !self.validated {
+            return Err("Block must be validated before use".into());
         }
-        size
+
+        Ok(self.data
+            .iter()
+            .filter_map(|item| item.as_ref())
+            .map(|bx| bx.0[2] * bx.0[3])
+            .collect())
     }
 
     fn build_hyberslab_selection(&self) -> Result<Selection> {
