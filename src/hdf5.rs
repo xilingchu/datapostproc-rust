@@ -1,20 +1,31 @@
 // src/hdf5.rs
 // High-level hdf5 method using hdf5-rust
 
-use hdf5::{File, Error, Result, types::{TypeDescriptor, FloatSize, IntSize}};
+use hdf5::{File, Dataset, Error, Result, Selection, types::{TypeDescriptor, FloatSize, IntSize}};
 use std::path::Path;
 use ndarray::ArrayD;
 
+// Macros
+// For hdf5.rs
+// Build the array to carry the value.
+macro_rules! array_create {
+    ($name:ident, $data_shape:expr, $data_type:ty) => {
+        #[allow(used_mut)]
+        let mut $name = match $data_shape.as_slice() {
+            &[1] => {
+                TypeData::Scalar(<$data_type>::default())
+            }
+            _ => {
+                TypeData::Array(ArrayD::<$data_type>::zeros($data_shape))
+            }
+        };
+    }
+}
+
 #[derive(Debug)]
-pub enum Hdf5Data {
-    ArrayF64(ArrayD<f64>),
-    ArrayF32(ArrayD<f32>),
-    ArrayI64(ArrayD<i64>),
-    ArrayI32(ArrayD<i32>),
-    I64(i64),
-    I32(i32),
-    F64(f64),
-    F32(f32)
+pub enum TypeData<T>{
+    Scalar(T),
+    Array(ArrayD<T>)
 }
 
 // Meaning of block
@@ -23,110 +34,83 @@ pub enum Hdf5Data {
 // stride ---- The length of two blocks
 // count  ---- The count of the blocks
 // block  ---- The size of one block
-#[derive(Debug, Clone)]
-pub struct BlockValue([i32; 4]);
+#[derive(Debug, Clone, Copy)]
+pub struct BlockValue([usize; 4]);
 
 impl BlockValue {
-    pub fn new(values: [i32; 4]) -> Result<Self, String> {
-        if values[1] <= 0 || values[2] <= 0 || values[3] <= 0{
-            Err("Stride, count and block must be positive".into())
+    fn new(values: [usize; 4]) -> Result<Self, String> {
+        if values[3] >= values[1] {
+            Err("Stride should be higher than block.".into())
         } else {
             Ok(Self(values))
         }
     }
-}
-
-pub struct Block {
-    blockx: Option<BlockValue>,
-    blocky: Option<BlockValue>,
-    blockz: Option<BlockValue>
-}
-
-impl Block {
-    fn validate_bounds(&self, shape: &[usize]) -> Result<Self, String> {
-        let rb = self.rb();
-        let len = shape.len();
-        let mut blockx = self.blockx.clone();
-        let mut blocky = self.blocky.clone();
-        let mut blockz = self.blockz.clone();
-        // z
-        if len >= 1 {
-            if let Some(rbz) = rb[2] {
-                if rbz > shape[2] as i32 {
-                    return Err("Block exceeds x dimension bounds".into());
-                } else {
-                    if self.blockz.is_none() {
-                        blockz = Some(BlockValue::new([1, 1, shape[2].try_into().unwrap(), 1])?);
-                    }
-                }
-            }
-            // y
-            if len >= 2 {
-                if let Some(rby) = rb[1] {
-                    if rby > shape[2] as i32 {
-                        return Err("Block exceeds y dimension bounds".into());
-                    } else {
-                        if self.blocky.is_none() {
-                            blocky = Some(BlockValue::new([1, 1, shape[1].try_into().unwrap(), 1])?);
-                        }
-                    }
-                }
-                if len >= 3 {
-                    if let Some(rbx) = rb[0] {
-                        if rbx > shape[0] as i32 {
-                            return Err("Block exceeds x dimension bounds".into());
-                        } else {
-                            if self.blockx.is_none() {
-                                blockx = Some(BlockValue::new([1, 1, shape[1].try_into().unwrap(), 1])?);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(Self { blockx: blockx, blocky: blocky, blockz:blockz })
+    
+    fn lb(&self) -> usize {
+        self.0[0]
     }
 
-    fn dim(&self) -> i32 {
-        let mut count:i32 = 0;
-        if self.blockx.is_some() {
-            count += 1;
+    fn rb(&self) -> usize {
+        self.0[0]+self.0[3]*(self.0[2]+self.0[4]-1)
+    }
+}
+
+
+
+#[derive(Debug, Clone)]
+pub struct Block(Vec<Option<BlockValue>>);
+
+impl Block {
+    // Validate block bounds
+    fn validate_bounds(&self, shape: &[usize]) -> Result<Self> {
+        let len = shape.len();
+        let block = &self.0.clone()[0..len];
+        // let dim = ['z', 'y', 'x'];
+        fn check_bound(blocki: Option<BlockValue>, b:usize) -> Result<Option<BlockValue>> {
+            if blocki.is_some() {
+                if blocki.unwrap().rb() < b {
+                    return Err(format!("Block exceeds bounds in dimension.").into());
+                } else {
+                    Ok(blocki)
+                }
+            } else {
+                Ok(Some(BlockValue::new([1, 1, b, 1])?))
+            }
         }
-        if self.blocky.is_some() {
-            count += 1;
+
+        // Renew the bounds
+        let mut block_out = Vec::new();
+        let mut i = 0usize;
+        for block_item in block {  
+            i += 1;
+            block_out.push(check_bound(*block_item, shape[i])?);
         }
-        if self.blockz.is_some() {
-            count += 1;
+
+        Ok(Block(block_out))
+    }
+
+    fn dim(&self) -> usize {
+        let mut count:usize = 0;
+        for block_item in &self.0{
+            if block_item.is_some() {
+                count += 1
+            }
         }
         count
     }
-    
-    fn rb(&self) -> [Option<i32>; 3] {
-        let mut result = [None, None, None];
-        if let Some(BlockValue(bx)) = self.blockx {
-            result[0] = Some(bx[0]+bx[3]*(bx[2]+bx[4]-1));
+
+    fn size(&self) -> Vec<usize> {
+        let mut size = Vec::new();
+        for block_item in &self.0{
+            if let Some(bx) = &block_item {
+                size.push(bx.0[2] * bx.0[3]);
+            }
         }
-        if let Some(BlockValue(by)) = self.blocky {
-            result[1] = Some(by[0]+by[3]*(by[2]+by[4]-1));
-        }
-        if let Some(BlockValue(bz)) = self.blockz {
-            result[2] = Some(bz[0]+bz[3]*(bz[2]+bz[4]-1));
-        }
-        result
+        size
     }
 
-    fn lb(&self) -> [Option<i32>; 3] {
-        let mut result = [None, None, None];
-        if let Some(BlockValue(bx)) = self.blockx {
-            result[0] = Some(bx[0]);
-        }
-        if let Some(BlockValue(by)) = self.blocky {
-            result[1] = Some(by[0]);
-        }
-        if let Some(BlockValue(bz)) = self.blockz {
-            result[2] = Some(bz[0]);
-        }
-        result
+    fn build_hyberslab_selection(&self) -> Result<Selection> {
+
     }
 }
 
@@ -140,12 +124,22 @@ pub trait HdfOper{
         Ok(())
     }
 
+    // Read data through chunking
+    fn chunking(dataset:Dataset, block:Block, shape:&[usize]) -> Result<ArrayD<_>, Error> {
+        let size = block.size();
+        let mut read_array = ArrayD::<_>::zeros(size);
+        OK(read_array)
+    }
+
+    // Read data
     fn read_data(
-        file:File, 
+        file:File,
         dataset:&str,
-        block: Block,
+        block:Block,
+        shape_bounds:&[usize]
         ) -> Result<Hdf5Data, Error> {
         let dataset = file.dataset(dataset)?;
+        ////////Validation of the dataset and block////////
         // Get the type of dataset
         let dtype = dataset.dtype()?;
         // Get the chunk through chunkx, chunky, and chunkz.
@@ -164,7 +158,8 @@ pub trait HdfOper{
                     if dataset.shape() == [1] {  // Scalar
                         dataset.read_1d::<i64>()?.first().copied().map(Hdf5Data::I64).ok_or_else(|| Error::from("Empty dataset"))
                     } else {
-                        dataset.read_dyn::<i64>().map(Hdf5Data::ArrayI64)
+                        dataset.read_dyn::<i64>().map(Hdf5Data::ArrayI64);
+                        let mut input = ArrayD::<i64>::zeros(shape_bounds);
                     }
                 },
                 IntSize::U4 => {
