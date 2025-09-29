@@ -38,7 +38,7 @@ pub enum TypeData<T>{
 pub struct BlockValue([usize; 4]);
 
 impl BlockValue {
-    fn new(values: [usize; 4]) -> Result<Self, String> {
+    fn new(values: [usize; 4]) -> Result<Self> {
         if values[3] >= values[1] {
             Err("Stride should be higher than block.".into())
         } else {
@@ -55,17 +55,25 @@ impl BlockValue {
     }
 }
 
-
-
 #[derive(Debug, Clone)]
-pub struct Block(Vec<Option<BlockValue>>);
+pub struct Block{
+    data: Vec<Option<BlockValue>>,
+    validated: bool,
+};
 
 impl Block {
+    pub fn new(values: Vec<Option<BlockValue>>) -> Self {
+        Self{
+            data: values,
+            validated: false,
+        }
+    }
     // Validate block bounds
-    fn validate_bounds(&self, shape: &[usize]) -> Result<Self> {
-        let len = shape.len();
-        let block = &self.0.clone()[0..len];
-        // let dim = ['z', 'y', 'x'];
+    fn validate_bounds(mut self, shape: &[usize]) -> Result<Self> {
+        if self.validated {
+            return Ok(self);
+        }
+        // Check bound function
         fn check_bound(blocki: Option<BlockValue>, b:usize) -> Result<Option<BlockValue>> {
             if blocki.is_some() {
                 if blocki.unwrap().rb() < b {
@@ -77,6 +85,9 @@ impl Block {
                 Ok(Some(BlockValue::new([1, 1, b, 1])?))
             }
         }
+        // Get the block
+        let len = shape.len();
+        let block = &self.data.clone()[0..len];
 
         // Renew the bounds
         let mut block_out = Vec::new();
@@ -86,12 +97,15 @@ impl Block {
             block_out.push(check_bound(*block_item, shape[i])?);
         }
 
-        Ok(Block(block_out))
+        self.data = block_out;
+        self.validated = true;
+
+        Ok(self)
     }
 
     fn dim(&self) -> usize {
         let mut count:usize = 0;
-        for block_item in &self.0{
+        for block_item in &self.data{
             if block_item.is_some() {
                 count += 1
             }
