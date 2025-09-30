@@ -1,7 +1,7 @@
 // src/hdf5.rs
 // High-level hdf5 method using hdf5-rust
 
-use hdf5::{File, Dataset, Error, Result, Selection, types::{TypeDescriptor, FloatSize, IntSize}};
+use hdf5::{File, Dataset, Error, Result, Selection, Hyperslab, SliceOrIndex, types::{TypeDescriptor, FloatSize, IntSize}};
 use std::path::Path;
 use ndarray::ArrayD;
 
@@ -123,7 +123,24 @@ impl Block {
     }
 
     fn build_hyberslab_selection(&self) -> Result<Selection> {
+        if !self.validated {
+            return Err("Block must be validated before use".into());
+        }
 
+        let ndim = self.dim()?;
+        let mut slices = Vec::with_capacity(ndim);
+        for i in 0..ndim {
+            let bv = &self.data[i].as_ref().ok_or("Missing block value in dimension.")?;
+            let slice = SliceOrIndex::SliceCount{
+                start: bv.0[0],
+                step: bv.0[1],
+                count: bv.0[2],
+                block: bv.0[3],
+            };
+            slices.push(slice);
+        }
+        let hyperslab = Hyperslab::from(slices);
+        Ok(Selection::from(hyperslab))
     }
 }
 
