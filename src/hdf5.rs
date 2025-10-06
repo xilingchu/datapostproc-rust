@@ -1,7 +1,7 @@
 // src/hdf5.rs
 // High-level hdf5 method using hdf5-rust
 
-use hdf5::{File, Dataset, Error, Result, Selection, Hyperslab, SliceOrIndex, types::{TypeDescriptor, FloatSize, IntSize}};
+use hdf5::{File, Dataset, Error, Result, Selection, Hyperslab, SliceOrIndex, H5Type, types::{TypeDescriptor, FloatSize, IntSize}};
 use std::path::Path;
 use ndarray::ArrayD;
 
@@ -59,7 +59,7 @@ impl BlockValue {
 pub struct Block{
     data: Vec<Option<BlockValue>>,
     validated: bool,
-};
+}
 
 impl Block {
     pub fn new(values: Vec<Option<BlockValue>>) -> Self {
@@ -88,19 +88,21 @@ impl Block {
         // Get the block
         let len = shape.len();
         let block = &self.data.clone()[0..len];
-
-        // Renew the bounds
-        let mut block_out = Vec::new();
-        let mut i = 0usize;
-        for block_item in block {  
-            i += 1;
-            block_out.push(check_bound(*block_item, shape[i])?);
+        if self.data.len() != len {
+            return Err(format!("The length of hyperslab is not match the length of the dataset.").into())
         }
-
-        self.data = block_out;
-        self.validated = true;
-
-        Ok(self)
+        else {
+        // Renew the bounds
+            let mut block_out = Vec::new();
+            let mut i = 0usize;
+            for block_item in block {  
+                i += 1;
+                block_out.push(check_bound(*block_item, shape[i])?);
+            }
+            self.data = block_out;
+            self.validated = true;
+            Ok(self)
+        }
     }
 
     fn dim(&self) -> Result<usize> {
@@ -144,6 +146,32 @@ impl Block {
     }
 }
 
+pub trait DatasetHyperslabExt {
+    /// Validate hyperslab and the dataset
+    // fn validate_hyperslab(
+    //     &self,
+    //     block: Block,
+    // ) -> bool;
+
+    /// Read from hyperslab
+    // fn read_hyperslab<T>(
+    //     &self,
+    //     hyperslab:Selection,
+    // ) -> Result<ArrayD<T>> 
+    // where
+    //     T: H5Type;
+
+    // fn write_hyperslab<T>(
+    //     &self,
+    //     hyperslab: Selection,
+    // ) -> Result<ArrayD<T>>
+    // where T: H5Type;
+}
+
+impl DatasetHyperslabExt for Dataset {
+}
+    
+
 pub trait HdfOper{
     fn open_file<P: AsRef<Path>>(filename: P) -> Result<File, Error> {
         File::open(filename)
@@ -181,7 +209,7 @@ pub trait HdfOper{
         }
         // Step 2. Control the region to read.
         block.validate_bounds(&shape);
-        // match dtype
+        // match dtype  
         match dtype.to_descriptor()? {
             TypeDescriptor::Integer(size) => match size {
                 IntSize::U8 => {
