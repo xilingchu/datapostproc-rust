@@ -92,7 +92,7 @@ impl Block {
             return Err(format!("The length of hyperslab is not match the length of the dataset.").into())
         }
         else {
-        // Renew the bounds
+             // Renew the bounds
             let mut block_out = Vec::new();
             let mut i = 0usize;
             for block_item in block {  
@@ -147,19 +147,15 @@ impl Block {
 }
 
 pub trait DatasetHyperslabExt {
-    /// Validate hyperslab and the dataset
-    // fn validate_hyperslab(
-    //     &self,
-    //     block: Block,
-    // ) -> bool;
-
+    /// if single?
+    fn is_single(self) -> bool;
     /// Read from hyperslab
-    // fn read_hyperslab<T>(
-    //     &self,
-    //     hyperslab:Selection,
-    // ) -> Result<ArrayD<T>> 
-    // where
-    //     T: H5Type;
+    /// fn read_hyperslab<T>(
+    ///     &self,
+    ///     block:Block,
+    /// ) -> Result<ArrayD<T>> 
+    /// where
+    ///     T: H5Type;
 
     // fn write_hyperslab<T>(
     //     &self,
@@ -169,6 +165,9 @@ pub trait DatasetHyperslabExt {
 }
 
 impl DatasetHyperslabExt for Dataset {
+    fn is_single(self) -> bool {
+        self.shape() == [1]
+    }
 }
     
 
