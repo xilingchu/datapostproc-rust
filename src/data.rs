@@ -3,20 +3,16 @@ use std::collections::HashMap;
 use hdf5::{Dataset, H5Type};
 use crate::hdf5::Block;
 
-pub struct H5file<'a, T> 
-where
-    T: H5Type
+pub struct H5File 
 {
-    filename: &'a str,
-    var: Vec<&'a str>,
-    data: HashMap<&'a str, Data<'a, T>>,
+    filename: String,
+    var: Vec<String>,
+    data: HashMap<String, Data>,
 }
 
-pub struct Data<'a, T> 
-where 
-    T: H5Type
+pub struct Data
 {
-    name: &'a str,
+    name: String,
     block: Block,
     dataset: Dataset,
 }
