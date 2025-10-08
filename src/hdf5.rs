@@ -237,71 +237,10 @@ pub trait HdfOper{
     {
         let size = block.size();
         if dataset.is_single() {
-            dataset.read_1d::<T>()?.first().copied().map(Hdf5Data::Scalar).ok_or_else(|| Error::from("Empty dataset"))
-
+            dataset.read_1d::<T>()?.first().copied().map(H5Data::Scalar).ok_or_else(|| Error::from("Empty dataset"))
+        } else {
+            dataset.read_hyperslab(block).map(H5Data::Array)
         }
         
-    }
-
-    // Read data
-    fn rsead_data(
-        file:File,
-        dataset:&str,
-        block:Block,
-        shape_bounds:&[usize]
-        ) -> Result<Hdf5Data, Error> {
-        let dataset = file.dataset(dataset)?;
-        ////////Validation of the dataset and block////////
-        // Get the type of dataset
-        let dtype = dataset.dtype()?;
-        // Get the chunk through chunkx, chunky, and chunkz.
-        // Step 1. Check the shape is legal or not.
-        let shape = dataset.shape();
-        let len = shape.len();
-        if block.dim() > len.try_into().unwrap(){
-            Error::from("The shape of block has error in dimension!");
-        }
-        // Step 2. Control the region to read.
-        block.validate_bounds(&shape);
-        // match dtype  
-        match dtype.to_descriptor()? {
-            TypeDescriptor::Integer(size) => match size {
-                IntSize::U8 => {
-                    if dataset.shape() == [1] {  // Scalar
-                        dataset.read_1d::<i64>()?.first().copied().map(Hdf5Data::I64).ok_or_else(|| Error::from("Empty dataset"))
-                    } else {
-                        dataset.read_dyn::<i64>().map(Hdf5Data::ArrayI64);
-                        let mut input = ArrayD::<i64>::zeros(shape_bounds);
-                    }
-                },
-                IntSize::U4 => {
-                    if dataset.shape() == [1] {
-                        dataset.read_1d::<i32>()?.first().copied().map(Hdf5Data::I32).ok_or_else(|| Error::from("Empty dataset"))
-                    } else {
-                        dataset.read_dyn::<i32>().map(Hdf5Data::ArrayI32)
-                    }
-                },
-                _ => Err(hdf5::Error::from("Unsupported integer size")),
-            },
-            TypeDescriptor::Float(size) => match size {
-                FloatSize::U8 => {
-                    if dataset.shape() == [1] {  // Scalar
-                        dataset.read_1d::<f64>()?.first().copied().map(Hdf5Data::F64).ok_or_else(|| Error::from("Empty dataset"))
-                    } else {
-                        dataset.read_dyn::<f64>().map(Hdf5Data::ArrayF64)
-                    }
-                },
-                FloatSize::U4 => {
-                    if dataset.shape() == [1] {
-                        dataset.read_1d::<f32>()?.first().copied().map(Hdf5Data::F32).ok_or_else(|| Error::from("Empty dataset"))
-                    } else {
-                        dataset.read_dyn::<f32>().map(Hdf5Data::ArrayF32)
-                    }
-                },
-                #[allow(unreachable_patterns)]
-                _ => Err(hdf5::Error::from("Unsupported integer size")),
-            },
-            _ => Err(hdf5::Error::from("Unsupported type"))
-        }
     }
 }
