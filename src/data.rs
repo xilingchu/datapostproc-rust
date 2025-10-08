@@ -1,20 +1,22 @@
-use std::collections::HashMap;
 // src/data.rs
-use ndarray::{ArrayD, Array1};
+use std::collections::HashMap;
+use hdf5::{Dataset, H5Type};
+use crate::hdf5::Block;
 
 pub struct H5file<'a, T> 
 where
-    T: ndarray::NdFloat
+    T: H5Type
 {
     filename: &'a str,
-    data: HashMap<String, Data<'a, T>>,
+    var: Vec<&'a str>,
+    data: HashMap<&'a str, Data<'a, T>>,
 }
 
 pub struct Data<'a, T> 
 where 
-    T: ndarray::NdFloat
+    T: H5Type
 {
     name: &'a str,
-    dimension: Array1<i32>,
-    dataset: ArrayD<T>,
+    block: Block,
+    dataset: Dataset,
 }
