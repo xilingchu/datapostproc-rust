@@ -69,9 +69,9 @@ impl Block {
         }
     }
     // Validate block bounds
-    fn validate_bounds(mut self, shape: &[usize]) -> Result<Self> {
+    fn validate_bounds(&mut self, shape: &[usize]) -> Result<()> {
         if self.validated {
-            return Ok(self);
+            return Ok(());
         }
         // Check bound function
         fn check_bound(blocki: Option<BlockValue>, b:usize) -> Result<Option<BlockValue>> {
@@ -101,7 +101,7 @@ impl Block {
             }
             self.data = block_out;
             self.validated = true;
-            Ok(self)
+            Ok(())
         }
     }
 
@@ -148,7 +148,7 @@ impl Block {
 
 pub trait DatasetHyperslabExt {
     /// if single?
-    fn is_single(self) -> bool;
+    fn is_single(&self) -> bool;
     /// Read from hyperslab
     fn read_hyperslab<T>(
         &self,
@@ -156,21 +156,17 @@ pub trait DatasetHyperslabExt {
     ) -> Result<ArrayD<T>> 
     where
         T: H5Type;
-    // fn write_hyperslab<T>(
-    //     &self,
-    //     hyperslab: Selection,
-    // ) -> Result<ArrayD<T>>
-    // where T: H5Type;
 }
 
 impl DatasetHyperslabExt for Dataset {
-    fn is_single(self) -> bool {
+    fn is_single(&self) -> bool {
         self.shape() == [1]
     }
 
+    /// Read through hyperslab
     fn read_hyperslab<T>(
         &self,
-        block:Block,
+        mut block:Block,
     ) -> Result<ArrayD<T>>
     where
         T: H5Type {
@@ -178,13 +174,11 @@ impl DatasetHyperslabExt for Dataset {
             return Err("Hyperslab should not be used in single data.".into());
         }
         let shape = &self.shape();
-        let mut _block = block.clone();
-        _block.validate_bounds(shape)?;
-        let select = _block.build_hyberslab_selection()?;
+        block.validate_bounds(&shape)?;
+        let select = block.build_hyberslab_selection()?;
         self.read_slice(select)
     }
 }
-    
 
 pub trait HdfOper{
     fn open_file<P: AsRef<Path>>(filename: P) -> Result<File, Error> {
