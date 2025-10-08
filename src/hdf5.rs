@@ -1,26 +1,26 @@
 // src/hdf5.rs
 // High-level hdf5 method using hdf5-rust
 
-use hdf5::{File, Dataset, Error, Result, Selection, Hyperslab, SliceOrIndex, H5Type, types::{TypeDescriptor, FloatSize, IntSize}};
+use hdf5::{File, Dataset, Error, Result, Selection, Hyperslab, SliceOrIndex, H5Type};
 use std::path::Path;
 use ndarray::ArrayD;
 
 // Macros
 // For hdf5.rs
 // Build the array to carry the value.
-macro_rules! array_create {
-    ($name:ident, $data_shape:expr, $data_type:ty) => {
-        #[allow(used_mut)]
-        let mut $name = match $data_shape.as_slice() {
-            &[1] => {
-                TypeData::Scalar(<$data_type>::default())
-            }
-            _ => {
-                TypeData::Array(ArrayD::<$data_type>::zeros($data_shape))
-            }
-        };
-    }
-}
+// macro_rules! array_create {
+//     ($name:ident, $data_shape:expr, $data_type:ty) => {
+//         #[allow(used_mut)]
+//         let mut $name = match $data_shape.as_slice() {
+//             &[1] => {
+//                 TypeData::Scalar(<$data_type>::default())
+//             }
+//             _ => {
+//                 TypeData::Array(ArrayD::<$data_type>::zeros($data_shape))
+//             }
+//         };
+//     }
+// }
 
 #[derive(Debug)]
 pub enum H5Data<T>{
@@ -37,6 +37,7 @@ pub enum H5Data<T>{
 #[derive(Debug, Clone, Copy)]
 pub struct BlockValue([usize; 4]);
 
+#[allow(dead_code)]
 impl BlockValue {
     fn new(values: [usize; 4]) -> Result<Self> {
         if values[3] >= values[1] {
@@ -227,20 +228,17 @@ pub trait HdfOper{
     }
 
     // Read data through chunking
-    fn read_data(
+    fn read_data<T>(
             dataset:Dataset,
-            mut block:Block,
-            shape:&[usize]
+            block:Block,
         ) -> Result<H5Data<T>>
         where
-            T: H5Type
+            T: H5Type + Copy
     {
-        let size = block.size();
         if dataset.is_single() {
             dataset.read_1d::<T>()?.first().copied().map(H5Data::Scalar).ok_or_else(|| Error::from("Empty dataset"))
         } else {
             dataset.read_hyperslab(block).map(H5Data::Array)
         }
-        
     }
 }
