@@ -23,7 +23,7 @@ macro_rules! array_create {
 }
 
 #[derive(Debug)]
-pub enum TypeData<T>{
+pub enum H5Data<T>{
     Scalar(T),
     Array(ArrayD<T>)
 }
@@ -150,13 +150,12 @@ pub trait DatasetHyperslabExt {
     /// if single?
     fn is_single(self) -> bool;
     /// Read from hyperslab
-    /// fn read_hyperslab<T>(
-    ///     &self,
-    ///     block:Block,
-    /// ) -> Result<ArrayD<T>> 
-    /// where
-    ///     T: H5Type;
-
+    fn read_hyperslab<T>(
+        &self,
+        block:Block,
+    ) -> Result<ArrayD<T>> 
+    where
+        T: H5Type;
     // fn write_hyperslab<T>(
     //     &self,
     //     hyperslab: Selection,
@@ -167,6 +166,22 @@ pub trait DatasetHyperslabExt {
 impl DatasetHyperslabExt for Dataset {
     fn is_single(self) -> bool {
         self.shape() == [1]
+    }
+
+    fn read_hyperslab<T>(
+        &self,
+        block:Block,
+    ) -> Result<ArrayD<T>>
+    where
+        T: H5Type {
+        if self.is_single() {
+            return Err("Hyperslab should not be used in single data.".into());
+        }
+        let shape = &self.shape();
+        let mut _block = block.clone();
+        _block.validate_bounds(shape)?;
+        let select = _block.build_hyberslab_selection()?;
+        self.read_slice(select)
     }
 }
     
