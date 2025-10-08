@@ -156,6 +156,14 @@ pub trait DatasetHyperslabExt {
     ) -> Result<ArrayD<T>> 
     where
         T: H5Type;
+    /// Write from hyperslab
+    fn write_hyperslab<T>(
+        &self,
+        data: &ArrayD<T>,
+        block:Block,
+    ) -> Result<()> 
+    where
+        T: H5Type;
 }
 
 impl DatasetHyperslabExt for Dataset {
@@ -178,6 +186,34 @@ impl DatasetHyperslabExt for Dataset {
         let select = block.build_hyberslab_selection()?;
         self.read_slice(select)
     }
+
+    /// Write from hyperslab
+    fn write_hyperslab<T>(
+        &self,
+        data: &ArrayD<T>,
+        mut block:Block,
+    ) -> Result<()> 
+    where
+        T: H5Type {
+        if self.is_single() {
+            return Err("Hyperslab should not be used in single data.".into());
+        }
+        // Get the shape of the block
+        let shape = &self.shape();
+        block.validate_bounds(&shape)?;
+        let select = block.build_hyberslab_selection()?;
+        // Get the shape of the data
+        let size = block.size()?;
+        if data.shape() != size {
+            return Err(format!("Data shape {:?} does not match expected hyperslab shape {:?}", 
+
+
+
+                    data.shape(), size).into());
+        }
+
+        self.write_slice(data, select)
+    }
 }
 
 pub trait HdfOper{
@@ -191,14 +227,24 @@ pub trait HdfOper{
     }
 
     // Read data through chunking
-    fn chunking(dataset:Dataset, block:Block, shape:&[usize]) -> Result<ArrayD<_>, Error> {
+    fn read_data(
+            dataset:Dataset,
+            mut block:Block,
+            shape:&[usize]
+        ) -> Result<H5Data<T>>
+        where
+            T: H5Type
+    {
         let size = block.size();
-        let mut read_array = ArrayD::<_>::zeros(size);
-        OK(read_array)
+        if dataset.is_single() {
+            dataset.read_1d::<T>()?.first().copied().map(Hdf5Data::Scalar).ok_or_else(|| Error::from("Empty dataset"))
+
+        }
+        
     }
 
     // Read data
-    fn read_data(
+    fn rsead_data(
         file:File,
         dataset:&str,
         block:Block,
