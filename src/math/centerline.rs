@@ -3,12 +3,14 @@
 
 use ndarray::Array1;
 
-pub fn get_centerline<T>(&u_slice: &Array1<T>, &uz_slice: &Array1<T>, &z: &Array1<T>) -> T {
-        let len = &uz_slice.len();
+pub fn get_centerline<T>(u_slice: &Array1<T>, uz_slice: &Array1<T>, z: &Array1<T>) -> T 
+    where T: Zero + Copy
+        {
+        let len = uz_slice.len();
         let mut locate = 0usize;
-        for i in 0..len {
-            if &uz_slice[i] * &uz_slice(i+1) < 0 {
-                let locate = i;
+        for i in 0..(len-1) {
+            if uz_slice[i] * uz_slice[i+1] < T::Zero() {
+                locate = i;
                 break;
             }
         }
