@@ -218,27 +218,23 @@ impl DatasetHyperslabExt for Dataset {
 }
 
 pub trait HdfOper{
-    fn open_file<P: AsRef<Path>>(filename: P) -> Result<File, Error> {
-        File::open(filename)
-    }
+    fn open_file<P: AsRef<Path>>(&self) -> Result<File, Error>;
 
-    fn close_file(file:File) -> Result<(), Error> {
-        drop(file);
-        Ok(())
-    }
+    fn close_file(file:File) -> Result<(), Error> ;
 
     // Read data through chunking
-    fn read_data<T>(
-            dataset:Dataset,
-            block:Block,
-        ) -> Result<H5Data<T>>
-        where
-            T: H5Type + Copy
-    {
-        if dataset.is_single() {
-            dataset.read_1d::<T>()?.first().copied().map(H5Data::Scalar).ok_or_else(|| Error::from("Empty dataset"))
-        } else {
-            dataset.read_hyperslab(block).map(H5Data::Array)
-        }
-    }
+    // fn read_data<T>(
+    //         &self,
+    //         dataset:Dataset,
+    //         block:Block,
+    //     ) -> Result<H5Data<T>>
+    //     where
+    //         T: H5Type + Copy
+    // {
+    //     if dataset.is_single() {
+    //         dataset.read_1d::<T>()?.first().copied().map(H5Data::Scalar).ok_or_else(|| Error::from("Empty dataset"))
+    //     } else {
+    //         dataset.read_hyperslab(block).map(H5Data::Array)
+    //     }
+    // }
 }
