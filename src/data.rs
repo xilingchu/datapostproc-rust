@@ -1,12 +1,14 @@
 // src/data.rs
 use std::collections::HashMap;
 use hdf5::{Dataset, File, Error, H5Type};
-use crate::hdf5::{Block, HdfOper, H5Data, DatasetHyperslabExt};
+use crate::hdf5::{Block, H5Data, DatasetHyperslabExt};
 
-pub struct H5File 
+
+pub struct H5File
 {
     file: File,
     filename: String,
+    info: DNSInfo,
     variables: Vec<String>,
     coords : HashMap<String, Data>,
     datasets: HashMap<String, Data>,
@@ -19,12 +21,27 @@ pub struct Data
     dataset: Dataset,
 }
 
+#[derive(Debug)]
+pub struct DNSInfo {
+    nx: Option<i32>,
+    ny: Option<i32>,
+    nz: Option<i32>,
+    lx: Option<f64>,
+    ly: Option<f64>,
+    lz: Option<f64>,
+    re: Option<f64>,
+    dt: Option<f64>,
+    is_periodic: bool,
+    is_defined: bool
+}
+
 impl H5File {
-    fn new(self, filename: &str) -> Result<Self, Error> {
+    fn new(filename: &str) -> Result<Self, Error> {
         let file = File::open(&filename)?;
         Ok(Self {
             file,
             filename: String::from(filename),
+            info: DNSInfo,
             variables: Vec::new(),
             coords: HashMap::new(),
             datasets: HashMap::new(),
@@ -47,7 +64,7 @@ impl H5File {
     }
 }
 
-impl Data {
+impl Data{
     pub fn new(name:String, block: Block, dataset: Dataset) -> Self {
         Self {name, block, dataset}
     }
@@ -69,14 +86,3 @@ impl Data {
     }
 }
 
-impl HdfOper for H5File {
-    // Open file
-    fn open_file<P: AsRef<std::path::Path>>(&self) -> hdf5::Result<File, Error> {
-        File::open(&self.filename)
-    }
-    // Drop file
-    fn close_file(file:File) -> Result<(), Error> {
-        drop(file);
-        Ok(())
-    }
-}
