@@ -1,7 +1,7 @@
 // src/data.rs
 use std::collections::HashMap;
 use hdf5::{Dataset, File, Error, H5Type};
-use crate::hdf5::{Block, HdfOper, H5Data};
+use crate::hdf5::{Block, HdfOper, H5Data, DatasetHyperslabExt};
 
 pub struct H5File 
 {
@@ -32,10 +32,9 @@ impl H5File {
     }
 
     fn add_coordinate(&mut self, name: &str, block:Block) -> Result<(), Error> {
-        self.coords.push(String::from(name));
         let dataset = self.file.dataset(name)?;
         let data = Data::new(String::from(name), block, dataset);
-        self.datasets.insert(String::from(name), data);
+        self.coords.insert(String::from(name), data);
         Ok(())
     }
 
@@ -58,7 +57,7 @@ impl Data {
             &self,
             dataset:Dataset,
             block:Block,
-        ) -> Result<H5Data<T>>
+        ) -> Result<H5Data<T>, Error>
         where
             T: H5Type + Copy
     {
