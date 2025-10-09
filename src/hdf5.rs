@@ -207,9 +207,6 @@ impl DatasetHyperslabExt for Dataset {
         let size = block.size()?;
         if data.shape() != size {
             return Err(format!("Data shape {:?} does not match expected hyperslab shape {:?}", 
-
-
-
                     data.shape(), size).into());
         }
 

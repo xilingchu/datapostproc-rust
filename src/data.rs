@@ -17,11 +17,11 @@ pub struct H5File
 pub struct Data
 {
     name: String,
-    block: Block,
+    block: Option<Block>,
     dataset: Dataset,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct DNSInfo {
     nx: Option<i32>,
     ny: Option<i32>,
@@ -41,7 +41,7 @@ impl H5File {
         Ok(Self {
             file,
             filename: String::from(filename),
-            info: DNSInfo,
+            info: DNSInfo::default(),
             variables: Vec::new(),
             coords: HashMap::new(),
             datasets: HashMap::new(),
@@ -55,34 +55,43 @@ impl H5File {
         Ok(())
     }
 
-    fn add_dataset(&mut self, name: &str, block:Block) -> Result<(), Error> {
+    fn add_dataset(&mut self, name: &str, block:Option<Block>) -> Result<(), Error> {
         self.variables.push(String::from(name));
         let dataset = self.file.dataset(name)?;
         let data = Data::new(String::from(name), block, dataset);
         self.datasets.insert(String::from(name), data);
         Ok(())
     }
+    
+    fn init_h5info(&mut self) -> Result<(),Error> {
+        if self.info.is_defined {
+            return Ok(())
+        }
+        let nx:i32 = self.add_dataset('nx', None).read_data;
+    }
 }
 
 impl Data{
-    pub fn new(name:String, block: Block, dataset: Dataset) -> Self {
+    pub fn new(name:String, block: Option<Block>, dataset: Dataset) -> Self {
         Self {name, block, dataset}
     }
 
     // Read data through chunking
     fn read_data<T>(
             &self,
-            dataset:Dataset,
-            block:Block,
         ) -> Result<H5Data<T>, Error>
         where
             T: H5Type + Copy
     {
-        if dataset.is_single() {
-            dataset.read_1d::<T>()?.first().copied().map(H5Data::Scalar).ok_or_else(|| Error::from("Empty dataset"))
-        } else {
-            dataset.read_hyperslab(block).map(H5Data::Array)
+        match &self.block {
+            None => self.dataset.read_1d::<T>()?.first().copied().map(H5Data::Scalar).ok_or_else(|| Error::from("Empty dataset")),
+            Some(block) => {
+                if self.dataset.is_single() {
+                    self.dataset.read_1d::<T>()?.first().copied().map(H5Data::Scalar).ok_or_else(|| Error::from("Empty dataset"))
+                } else {
+                    self.dataset.read_hyperslab(block.clone()).map(H5Data::Array)
+                }
+            }
         }
     }
 }
-
