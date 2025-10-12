@@ -48,7 +48,7 @@ impl H5File {
         })
     }
 
-    fn add_coordinate(&mut self, name: &str, block:Block) -> Result<(), Error> {
+    fn add_coordinate(&mut self, name: &str, block:Option<Block>) -> Result<(), Error> {
         let dataset = self.file.dataset(name)?;
         let data = Data::new(String::from(name), block, dataset);
         self.coords.insert(String::from(name), data);
@@ -61,13 +61,6 @@ impl H5File {
         let data = Data::new(String::from(name), block, dataset);
         self.datasets.insert(String::from(name), data);
         Ok(())
-    }
-    
-    fn init_h5info(&mut self) -> Result<(),Error> {
-        if self.info.is_defined {
-            return Ok(())
-        }
-        let nx:i32 = self.add_dataset('nx', None).read_data;
     }
 }
 
