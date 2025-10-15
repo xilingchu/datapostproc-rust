@@ -77,7 +77,13 @@ impl Data{
             T: H5Type + Copy
     {
         match &self.block {
-            None => self.dataset.read_1d::<T>()?.first().copied().map(H5Data::Scalar).ok_or_else(|| Error::from("Empty dataset")),
+            None => {
+                if self.dataset.is_single() {
+                    self.dataset.read_1d::<T>()?.first().copied().map(H5Data::Scalar).ok_or_else(|| Error::from("Empty dataset"))
+                } else {
+                    self.dataset.read_dyn().map(H5Data::Array)
+                }
+            }
             Some(block) => {
                 if self.dataset.is_single() {
                     self.dataset.read_1d::<T>()?.first().copied().map(H5Data::Scalar).ok_or_else(|| Error::from("Empty dataset"))
