@@ -1,7 +1,6 @@
 [workspace]
 members = [
-	"datapostproc",
-	"struct-macro"
+	"datapostproc", "macro_struct"
 ]
 resolver = "2"
 
