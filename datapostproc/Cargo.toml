@@ -11,3 +11,4 @@ ndarray = {version = '0.16.1', features = ["blas"]}
 clap = '4.5.40'
 hdf5 = { package = "hdf5-metno", version = "0.10.1", features = ["blosc"]}
 #internal
+macro-struct = { workspace = true }

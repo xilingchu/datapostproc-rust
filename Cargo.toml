@@ -21,4 +21,4 @@ quote = "1.0"
 proc-macro2 = "1.0"
 # internal
 datapostproc = {package = 'datapostproc', version = '0.1.0', path='datapostproc'}
-struct-macro = {package = 'struct-macro', version = '0.1.0', path='struct-macro'}
+macro-struct = {package = 'macro-struct', version = '0.1.0', path='macro_struct'}
