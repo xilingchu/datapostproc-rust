@@ -1,8 +1,7 @@
 // src/hdf5.rs
 // High-level hdf5 method using hdf5-rust
 
-use hdf5::{File, Dataset, Error, Result, Selection, Hyperslab, SliceOrIndex, H5Type};
-use std::path::Path;
+use hdf5::{Dataset, Result, Selection, Hyperslab, SliceOrIndex, H5Type};
 use ndarray::ArrayD;
 
 // Macros
@@ -40,8 +39,8 @@ pub struct BlockValue([usize; 4]);
 #[allow(dead_code)]
 impl BlockValue {
     fn new(values: [usize; 4]) -> Result<Self> {
-        if values[3] >= values[1] {
-            Err("Stride should be higher than block.".into())
+        if values[3] > values[1] {
+            Err("Stride should be >= block size.".into())
         } else {
             Ok(Self(values))
         }
@@ -52,7 +51,8 @@ impl BlockValue {
     }
 
     fn rb(&self) -> usize {
-        self.0[0]+self.0[3]*(self.0[2]+self.0[4]-1)
+        // start + stride * (count - 1) + block - 1
+        self.0[0] + self.0[1] * (self.0[2] - 1) + self.0[3] - 1
     }
 }
 
@@ -95,9 +95,7 @@ impl Block {
         else {
              // Renew the bounds
             let mut block_out = Vec::new();
-            let mut i = 0usize;
-            for block_item in block {  
-                i += 1;
+            for (i, block_item) in block.iter().enumerate() {
                 block_out.push(check_bound(*block_item, shape[i])?);
             }
             self.data = block_out;
