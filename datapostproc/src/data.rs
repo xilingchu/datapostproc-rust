@@ -34,7 +34,7 @@ impl DNSInfo {
         let nx = file.dataset("x")?.shape()[0] as i32;
         let ny = file.dataset("y")?.shape()[0] as i32;
         let nz = file.dataset("zc")?.shape()[0] as i32;
-        let nu = file.dataset("nu")?.read_scalar::<f64>()?;
+        let nu = file.dataset("nu")?.read_1d::<f64>()?[0];
         Ok(Self {
             nx: Some(nx),
             ny: Some(ny),
@@ -61,11 +61,26 @@ impl H5File {
     }
 
     pub fn add_dataset(&mut self, name: &str, block: Option<Block>) -> Result<(), Error> {
-        self.variables.push(String::from(name));
         let dataset = self.file.dataset(name)?;
         let data = Data::new(String::from(name), block, dataset);
+        self.variables.push(String::from(name));
         self.datasets.insert(String::from(name), data);
         Ok(())
+    }
+
+    pub fn add_datasets(&mut self, names: &[&str]) -> Result<(), Error> {
+        for name in names {
+            self.add_dataset(name, None)?;
+        }
+        Ok(())
+    }
+
+    pub fn dataset(&self, name: &str) -> Option<&Data> {
+        self.datasets.get(name)
+    }
+
+    pub fn list_variables(&self) -> Result<Vec<String>, Error> {
+        Ok(self.file.member_names()?)
     }
 
     pub fn get_info(&mut self) -> Result<(), Error> {
