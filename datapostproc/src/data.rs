@@ -83,6 +83,13 @@ impl H5File {
         Ok(self.file.member_names()?)
     }
 
+    pub fn init(&mut self, variables: &[&str]) -> Result<(), Error> {
+        self.get_info()?;
+        self.load_coords()?;
+        self.add_datasets(variables)?;
+        Ok(())
+    }
+
     pub fn get_info(&mut self) -> Result<(), Error> {
         self.info = DNSInfo::from_h5file(&self.file)?;
         Ok(())
@@ -111,11 +118,20 @@ impl H5File {
     pub fn info_mut(&mut self) -> &mut DNSInfo {
         &mut self.info
     }
+
+    pub fn filename(&self) -> &str {
+        &self.filename
+    }
 }
+
 
 impl Data {
     pub fn new(name: String, block: Option<Block>, dataset: Dataset) -> Self {
         Self { name, block, dataset }
+    }
+
+    pub fn shape(&self) -> Vec<usize> {
+        self.dataset.shape()
     }
 
     pub fn read_data<T>(&self) -> Result<H5Data<T>, Error>
