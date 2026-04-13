@@ -38,7 +38,7 @@ pub struct BlockValue([usize; 4]);
 
 #[allow(dead_code)]
 impl BlockValue {
-    fn new(values: [usize; 4]) -> Result<Self> {
+    pub fn new(values: [usize; 4]) -> Result<Self> {
         if values[3] > values[1] {
             Err("Stride should be >= block size.".into())
         } else {
