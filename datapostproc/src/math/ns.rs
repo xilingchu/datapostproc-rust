@@ -8,15 +8,26 @@
 ///
 /// For a steady or time-averaged field R should be near zero.
 /// For an instantaneous snapshot R equals ∂u_i/∂t.
+///
+/// DNS channel flow convention for `periodic`:
+///   axis 0 (z, wall-normal) → false
+///   axis 1 (y, spanwise)    → true
+///   axis 2 (x, streamwise)  → true
 
 use ndarray::{Array1, ArrayD, Axis};
 use hdf5::Error;
 
-/// First derivative of `f` along `axis` on a non-uniform grid defined by `coords`.
+/// First derivative of `f` along `axis` on a (possibly non-uniform) grid.
 ///
-/// Interior: second-order central difference (Lagrange 3-point).
-/// Boundaries: first-order one-sided difference.
-pub fn deriv1(f: &ArrayD<f64>, axis: usize, coords: &Array1<f64>) -> Result<ArrayD<f64>, Error> {
+/// * `periodic = false` – one-sided first-order difference at the two boundaries.
+/// * `periodic = true`  – second-order central difference that wraps around
+///   (assumes uniform spacing in the periodic direction, as is standard in DNS).
+pub fn deriv1(
+    f: &ArrayD<f64>,
+    axis: usize,
+    coords: &Array1<f64>,
+    periodic: bool,
+) -> Result<ArrayD<f64>, Error> {
     let n = f.shape()[axis];
     if coords.len() != n {
         return Err(format!(
@@ -34,34 +45,67 @@ pub fn deriv1(f: &ArrayD<f64>, axis: usize, coords: &Array1<f64>) -> Result<Arra
     let mut df = f.to_owned();
     for i in 0..n {
         let slice = if i == 0 {
-            let f0 = f.index_axis(Axis(axis), 0);
-            let f1 = f.index_axis(Axis(axis), 1);
-            let dx = coords[1] - coords[0];
-            (&f1 - &f0) / dx
+            if periodic {
+                // Wrap: left neighbour is f[n-1], right is f[1].
+                // Uniform spacing assumed for periodic directions.
+                let dl = coords[1] - coords[0];
+                let dr = coords[1] - coords[0];
+                let fm = f.index_axis(Axis(axis), n - 1);
+                let fc = f.index_axis(Axis(axis), 0);
+                let fp = f.index_axis(Axis(axis), 1);
+                &fm * (-dr / (dl * (dl + dr)))
+                    + &fc * ((dr - dl) / (dl * dr))
+                    + &fp * (dl / (dr * (dl + dr)))
+            } else {
+                let f0 = f.index_axis(Axis(axis), 0);
+                let f1 = f.index_axis(Axis(axis), 1);
+                let dx = coords[1] - coords[0];
+                (&f1 - &f0) / dx
+            }
         } else if i == n - 1 {
-            let fn1 = f.index_axis(Axis(axis), n - 1);
-            let fn2 = f.index_axis(Axis(axis), n - 2);
-            let dx = coords[n - 1] - coords[n - 2];
-            (&fn1 - &fn2) / dx
+            if periodic {
+                // Wrap: left neighbour is f[n-2], right is f[0].
+                let dl = coords[n - 1] - coords[n - 2];
+                let dr = coords[n - 1] - coords[n - 2];
+                let fm = f.index_axis(Axis(axis), n - 2);
+                let fc = f.index_axis(Axis(axis), n - 1);
+                let fp = f.index_axis(Axis(axis), 0);
+                &fm * (-dr / (dl * (dl + dr)))
+                    + &fc * ((dr - dl) / (dl * dr))
+                    + &fp * (dl / (dr * (dl + dr)))
+            } else {
+                let fn1 = f.index_axis(Axis(axis), n - 1);
+                let fn2 = f.index_axis(Axis(axis), n - 2);
+                let dx = coords[n - 1] - coords[n - 2];
+                (&fn1 - &fn2) / dx
+            }
         } else {
             let fm = f.index_axis(Axis(axis), i - 1);
             let fc = f.index_axis(Axis(axis), i);
             let fp = f.index_axis(Axis(axis), i + 1);
             let dl = coords[i] - coords[i - 1];
             let dr = coords[i + 1] - coords[i];
-            // Second-order non-uniform central difference weights from Lagrange interpolation.
-            &fm * (-dr / (dl * (dl + dr))) + &fc * ((dr - dl) / (dl * dr)) + &fp * (dl / (dr * (dl + dr)))
+            // Second-order non-uniform central difference (Lagrange 3-point weights).
+            &fm * (-dr / (dl * (dl + dr)))
+                + &fc * ((dr - dl) / (dl * dr))
+                + &fp * (dl / (dr * (dl + dr)))
         };
         df.index_axis_mut(Axis(axis), i).assign(&slice);
     }
     Ok(df)
 }
 
-/// Second derivative of `f` along `axis` on a non-uniform grid defined by `coords`.
+/// Second derivative of `f` along `axis` on a (possibly non-uniform) grid.
 ///
-/// Interior: second-order 3-point Lagrange stencil.
-/// Boundaries: one-sided 3-point stencil (requires n >= 3).
-pub fn deriv2(f: &ArrayD<f64>, axis: usize, coords: &Array1<f64>) -> Result<ArrayD<f64>, Error> {
+/// * `periodic = false` – one-sided 3-point Lagrange stencil at the boundaries
+///   (requires n >= 3).
+/// * `periodic = true`  – wraps around at boundaries, uniform spacing assumed.
+pub fn deriv2(
+    f: &ArrayD<f64>,
+    axis: usize,
+    coords: &Array1<f64>,
+    periodic: bool,
+) -> Result<ArrayD<f64>, Error> {
     let n = f.shape()[axis];
     if coords.len() != n {
         return Err(format!(
@@ -73,7 +117,11 @@ pub fn deriv2(f: &ArrayD<f64>, axis: usize, coords: &Array1<f64>) -> Result<Arra
         .into());
     }
     if n < 3 {
-        return Err(format!("need at least 3 points along axis {} for second derivative", axis).into());
+        return Err(format!(
+            "need at least 3 points along axis {} for second derivative",
+            axis
+        )
+        .into());
     }
 
     let mut d2f = f.to_owned();
@@ -81,23 +129,39 @@ pub fn deriv2(f: &ArrayD<f64>, axis: usize, coords: &Array1<f64>) -> Result<Arra
         // Lagrange second-derivative weights for 3 points with spacings h1, h2:
         //   f''(x_k) = 2*f0/(h1*(h1+h2)) − 2*f1/(h1*h2) + 2*f2/(h2*(h1+h2))
         let slice = if i == 0 {
-            let f0 = f.index_axis(Axis(axis), 0);
-            let f1 = f.index_axis(Axis(axis), 1);
-            let f2 = f.index_axis(Axis(axis), 2);
-            let h1 = coords[1] - coords[0];
-            let h2 = coords[2] - coords[1];
-            &f0 * (2.0 / (h1 * (h1 + h2)))
-                + &f1 * (-2.0 / (h1 * h2))
-                + &f2 * (2.0 / (h2 * (h1 + h2)))
+            if periodic {
+                let h = coords[1] - coords[0]; // uniform → h1 = h2 = h
+                let fm = f.index_axis(Axis(axis), n - 1);
+                let fc = f.index_axis(Axis(axis), 0);
+                let fp = f.index_axis(Axis(axis), 1);
+                (&fm + &fp - &fc * 2.0) / (h * h)
+            } else {
+                let f0 = f.index_axis(Axis(axis), 0);
+                let f1 = f.index_axis(Axis(axis), 1);
+                let f2 = f.index_axis(Axis(axis), 2);
+                let h1 = coords[1] - coords[0];
+                let h2 = coords[2] - coords[1];
+                &f0 * (2.0 / (h1 * (h1 + h2)))
+                    + &f1 * (-2.0 / (h1 * h2))
+                    + &f2 * (2.0 / (h2 * (h1 + h2)))
+            }
         } else if i == n - 1 {
-            let f0 = f.index_axis(Axis(axis), n - 3);
-            let f1 = f.index_axis(Axis(axis), n - 2);
-            let f2 = f.index_axis(Axis(axis), n - 1);
-            let h1 = coords[n - 2] - coords[n - 3];
-            let h2 = coords[n - 1] - coords[n - 2];
-            &f0 * (2.0 / (h1 * (h1 + h2)))
-                + &f1 * (-2.0 / (h1 * h2))
-                + &f2 * (2.0 / (h2 * (h1 + h2)))
+            if periodic {
+                let h = coords[n - 1] - coords[n - 2];
+                let fm = f.index_axis(Axis(axis), n - 2);
+                let fc = f.index_axis(Axis(axis), n - 1);
+                let fp = f.index_axis(Axis(axis), 0);
+                (&fm + &fp - &fc * 2.0) / (h * h)
+            } else {
+                let f0 = f.index_axis(Axis(axis), n - 3);
+                let f1 = f.index_axis(Axis(axis), n - 2);
+                let f2 = f.index_axis(Axis(axis), n - 1);
+                let h1 = coords[n - 2] - coords[n - 3];
+                let h2 = coords[n - 1] - coords[n - 2];
+                &f0 * (2.0 / (h1 * (h1 + h2)))
+                    + &f1 * (-2.0 / (h1 * h2))
+                    + &f2 * (2.0 / (h2 * (h1 + h2)))
+            }
         } else {
             let fm = f.index_axis(Axis(axis), i - 1);
             let fc = f.index_axis(Axis(axis), i);
@@ -115,7 +179,8 @@ pub fn deriv2(f: &ArrayD<f64>, axis: usize, coords: &Array1<f64>) -> Result<Arra
 
 /// Continuity residual: ∇·u = ∂u/∂x + ∂v/∂y + ∂w/∂z.
 ///
-/// Should be near zero everywhere for incompressible DNS data.
+/// `periodic[axis]` sets the boundary treatment per axis (0=z, 1=y, 2=x).
+/// Typical DNS channel flow: `[false, true, true]`.
 pub fn divergence(
     u: &ArrayD<f64>,
     v: &ArrayD<f64>,
@@ -123,11 +188,14 @@ pub fn divergence(
     x: &Array1<f64>,
     y: &Array1<f64>,
     z: &Array1<f64>,
+    periodic: [bool; 3],
 ) -> Result<ArrayD<f64>, Error> {
     if v.shape() != u.shape() || w.shape() != u.shape() {
         return Err("u, v, w must have the same shape".into());
     }
-    Ok(deriv1(u, 2, x)? + deriv1(v, 1, y)? + deriv1(w, 0, z)?)
+    Ok(deriv1(u, 2, x, periodic[2])?
+        + deriv1(v, 1, y, periodic[1])?
+        + deriv1(w, 0, z, periodic[0])?)
 }
 
 /// Navier-Stokes momentum residual at every grid point for incompressible flow.
@@ -138,10 +206,12 @@ pub fn divergence(
 ///   R_z = u ∂w/∂x + v ∂w/∂y + w ∂w/∂z + ∂p/∂z − ν ∇²w
 ///
 /// # Arguments
-/// * `u`, `v`, `w` – velocity components (x, y, z); all shaped `(nz, ny, nx)`
-/// * `p`           – pressure, same shape
-/// * `x`, `y`, `z` – coordinate arrays with lengths `nx`, `ny`, `nz` respectively
-/// * `nu`          – kinematic viscosity
+/// * `u`, `v`, `w`  – velocity components (x, y, z); all shaped `(nz, ny, nx)`
+/// * `p`            – pressure, same shape
+/// * `x`, `y`, `z`  – coordinate arrays with lengths `nx`, `ny`, `nz`
+/// * `nu`           – kinematic viscosity
+/// * `periodic`     – `[z_periodic, y_periodic, x_periodic]` (axis 0/1/2).
+///                    Typical channel DNS: `[false, true, true]`.
 ///
 /// # Returns
 /// `(res_x, res_y, res_z)` – residual arrays, same shape as input.
@@ -154,34 +224,37 @@ pub fn ns_momentum_residual(
     y: &Array1<f64>,
     z: &Array1<f64>,
     nu: f64,
+    periodic: [bool; 3],
 ) -> Result<(ArrayD<f64>, ArrayD<f64>, ArrayD<f64>), Error> {
     let shape = u.shape();
     if v.shape() != shape || w.shape() != shape || p.shape() != shape {
         return Err("u, v, w, p must all have the same shape".into());
     }
 
+    let (pz, py, px) = (periodic[0], periodic[1], periodic[2]);
+
     // Velocity gradients (axis 0=z, 1=y, 2=x)
-    let du_dx = deriv1(u, 2, x)?;
-    let du_dy = deriv1(u, 1, y)?;
-    let du_dz = deriv1(u, 0, z)?;
+    let du_dx = deriv1(u, 2, x, px)?;
+    let du_dy = deriv1(u, 1, y, py)?;
+    let du_dz = deriv1(u, 0, z, pz)?;
 
-    let dv_dx = deriv1(v, 2, x)?;
-    let dv_dy = deriv1(v, 1, y)?;
-    let dv_dz = deriv1(v, 0, z)?;
+    let dv_dx = deriv1(v, 2, x, px)?;
+    let dv_dy = deriv1(v, 1, y, py)?;
+    let dv_dz = deriv1(v, 0, z, pz)?;
 
-    let dw_dx = deriv1(w, 2, x)?;
-    let dw_dy = deriv1(w, 1, y)?;
-    let dw_dz = deriv1(w, 0, z)?;
+    let dw_dx = deriv1(w, 2, x, px)?;
+    let dw_dy = deriv1(w, 1, y, py)?;
+    let dw_dz = deriv1(w, 0, z, pz)?;
 
     // Pressure gradients
-    let dp_dx = deriv1(p, 2, x)?;
-    let dp_dy = deriv1(p, 1, y)?;
-    let dp_dz = deriv1(p, 0, z)?;
+    let dp_dx = deriv1(p, 2, x, px)?;
+    let dp_dy = deriv1(p, 1, y, py)?;
+    let dp_dz = deriv1(p, 0, z, pz)?;
 
     // Viscous term: ν ∇²u_i
-    let visc_u = (deriv2(u, 2, x)? + deriv2(u, 1, y)? + deriv2(u, 0, z)?) * nu;
-    let visc_v = (deriv2(v, 2, x)? + deriv2(v, 1, y)? + deriv2(v, 0, z)?) * nu;
-    let visc_w = (deriv2(w, 2, x)? + deriv2(w, 1, y)? + deriv2(w, 0, z)?) * nu;
+    let visc_u = (deriv2(u, 2, x, px)? + deriv2(u, 1, y, py)? + deriv2(u, 0, z, pz)?) * nu;
+    let visc_v = (deriv2(v, 2, x, px)? + deriv2(v, 1, y, py)? + deriv2(v, 0, z, pz)?) * nu;
+    let visc_w = (deriv2(w, 2, x, px)? + deriv2(w, 1, y, py)? + deriv2(w, 0, z, pz)?) * nu;
 
     // R = convection + pressure gradient − viscous diffusion
     let res_x = (u * &du_dx) + (v * &du_dy) + (w * &du_dz) + dp_dx - visc_u;
@@ -193,8 +266,7 @@ pub fn ns_momentum_residual(
 
 /// L2 norm of the N-S residual: `sqrt(mean(R_x² + R_y² + R_z²))`.
 ///
-/// A single scalar that quantifies how well momentum is conserved across
-/// the entire domain. Useful for a quick sanity check.
+/// A single scalar quantifying how well momentum is conserved across the domain.
 pub fn ns_residual_l2(
     res_x: &ArrayD<f64>,
     res_y: &ArrayD<f64>,
@@ -222,13 +294,14 @@ mod tests {
         Array1::linspace(start, end, n)
     }
 
+    // ── derivative accuracy ───────────────────────────────────────────────────
+
     #[test]
-    fn deriv1_uniform_sin() {
+    fn deriv1_nonperiodic_sin() {
         let n = 100;
         let x = linspace(0.0, 2.0 * std::f64::consts::PI, n);
         let f = x.mapv(f64::sin).into_dyn();
-        let df = deriv1(&f, 0, &x).unwrap();
-        // Interior error should be O(dx²) ≈ 1e-4 for n=100
+        let df = deriv1(&f, 0, &x, false).unwrap();
         let max_err = (2..n - 2)
             .map(|i| (df[IxDyn(&[i])] - x[i].cos()).abs())
             .fold(0.0_f64, f64::max);
@@ -236,37 +309,73 @@ mod tests {
     }
 
     #[test]
-    fn deriv2_uniform_sin() {
+    fn deriv2_nonperiodic_sin() {
         let n = 100;
         let x = linspace(0.0, 2.0 * std::f64::consts::PI, n);
         let f = x.mapv(f64::sin).into_dyn();
-        let d2f = deriv2(&f, 0, &x).unwrap();
-        // d²sin/dx² = -sin; interior error O(dx²)
+        let d2f = deriv2(&f, 0, &x, false).unwrap();
         let max_err = (2..n - 2)
             .map(|i| (d2f[IxDyn(&[i])] + x[i].sin()).abs())
             .fold(0.0_f64, f64::max);
         assert!(max_err < 1e-3, "max interior error = {}", max_err);
     }
 
-    /// Couette flow is an exact steady N-S solution:
-    ///   u(z) = z, v = w = 0, p = 0  →  residual must be identically zero.
+    /// With periodic BC the boundary points should also reach O(dx²) accuracy.
+    #[test]
+    fn deriv1_periodic_recovers_boundary() {
+        let n = 128;
+        // [0, 2π) — exclude the endpoint so the grid is truly periodic
+        let dx = 2.0 * std::f64::consts::PI / n as f64;
+        let x: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 * dx));
+        let f = x.mapv(f64::sin).into_dyn();
+        let df = deriv1(&f, 0, &x, true).unwrap();
+
+        // All points (including boundaries) should recover cos(x)
+        let max_err = (0..n)
+            .map(|i| (df[IxDyn(&[i])] - x[i].cos()).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(max_err < 1e-3, "max error (periodic) = {:.2e}", max_err);
+    }
+
+    #[test]
+    fn deriv2_periodic_recovers_boundary() {
+        let n = 128;
+        let dx = 2.0 * std::f64::consts::PI / n as f64;
+        let x: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 * dx));
+        let f = x.mapv(f64::sin).into_dyn();
+        let d2f = deriv2(&f, 0, &x, true).unwrap();
+
+        let max_err = (0..n)
+            .map(|i| (d2f[IxDyn(&[i])] + x[i].sin()).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(max_err < 1e-3, "max error (periodic) = {:.2e}", max_err);
+    }
+
+    // ── N-S residual ─────────────────────────────────────────────────────────
+
+    /// Couette flow: u(z) = z, v = w = p = 0, non-periodic in z.
+    /// Exact steady solution → residual must be zero everywhere.
     #[test]
     fn ns_residual_couette_is_zero() {
         let (nz, ny, nx) = (20, 4, 4);
         let x = linspace(0.0, 1.0, nx);
         let y = linspace(0.0, 1.0, ny);
         let z = linspace(0.0, 1.0, nz);
-        let nu = 1e-3;
 
         let u = Array3::from_shape_fn((nz, ny, nx), |(iz, _, _)| z[iz]).into_dyn();
         let zero = ArrayD::zeros(u.raw_dim());
 
-        let (rx, ry, rz) =
-            ns_momentum_residual(&u, &zero, &zero, &zero, &x, &y, &z, nu).unwrap();
+        let (rx, ry, rz) = ns_momentum_residual(
+            &u, &zero, &zero, &zero,
+            &x, &y, &z, 1e-3,
+            [false, false, false],
+        ).unwrap();
 
         let l2 = ns_residual_l2(&rx, &ry, &rz).unwrap();
         assert!(l2 < 1e-10, "Couette residual L2 = {:.2e}", l2);
     }
+
+    // ── continuity ────────────────────────────────────────────────────────────
 
     /// ∇·(x, y, −2z) = 1 + 1 − 2 = 0 everywhere.
     #[test]
@@ -280,7 +389,7 @@ mod tests {
         let v = Array3::from_shape_fn((n, n, n), |(_, iy, _)| y[iy]).into_dyn();
         let w = Array3::from_shape_fn((n, n, n), |(iz, _, _)| -2.0 * z[iz]).into_dyn();
 
-        let div = divergence(&u, &v, &w, &x, &y, &z).unwrap();
+        let div = divergence(&u, &v, &w, &x, &y, &z, [false, false, false]).unwrap();
         let max_err = div.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
         assert!(max_err < 1e-10, "max divergence error = {:.2e}", max_err);
     }
