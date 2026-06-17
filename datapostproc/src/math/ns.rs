@@ -249,33 +249,37 @@ pub fn ns_momentum_residual(
 
     let (pz, py, px) = (periodic[0], periodic[1], periodic[2]);
 
-    // Velocity gradients (axis 0=z, 1=y, 2=x)
-    let du_dx = deriv1(u, 2, x, px)?;
-    let du_dy = deriv1(u, 1, y, py)?;
-    let du_dz = deriv1(u, 0, z, pz)?;
+    // Momentum flux tensors (element-wise products), matching the Fortran staggered-grid
+    // divergence form: conv = ∂(u_i u)/∂x + ∂(u_i v)/∂y + ∂(u_i w)/∂z
+    // On the collocated post-processing grid this is equivalent to the Fortran's
+    // 0.25*(ue*ue - uw*uw)*d1xp + ... stencil for cell-centred data.
+    let uu = u * u;
+    let uv = u * v;
+    let uw_f = u * w;
+    let vv = v * v;
+    let vw_f = v * w;
+    let ww = w * w;
 
-    let dv_dx = deriv1(v, 2, x, px)?;
-    let dv_dy = deriv1(v, 1, y, py)?;
-    let dv_dz = deriv1(v, 0, z, pz)?;
-
-    let dw_dx = deriv1(w, 2, x, px)?;
-    let dw_dy = deriv1(w, 1, y, py)?;
-    let dw_dz = deriv1(w, 0, z, pz)?;
+    // Divergence-form convection (matches Fortran lineStep)
+    let conv_u = deriv1(&uu,   2, x, px)? + deriv1(&uv,   1, y, py)? + deriv1(&uw_f, 0, z, pz)?;
+    let conv_v = deriv1(&uv,   2, x, px)? + deriv1(&vv,   1, y, py)? + deriv1(&vw_f, 0, z, pz)?;
+    let conv_w = deriv1(&uw_f, 2, x, px)? + deriv1(&vw_f, 1, y, py)? + deriv1(&ww,   0, z, pz)?;
 
     // Pressure gradients
     let dp_dx = deriv1(p, 2, x, px)?;
     let dp_dy = deriv1(p, 1, y, py)?;
     let dp_dz = deriv1(p, 0, z, pz)?;
 
-    // Viscous term: ν ∇²u_i
+    // Viscous term: ν ∇²u_i  (matches Fortran's (due*d2xp - duw*d2xm + ...)*nu)
     let visc_u = (deriv2(u, 2, x, px)? + deriv2(u, 1, y, py)? + deriv2(u, 0, z, pz)?) * nu;
     let visc_v = (deriv2(v, 2, x, px)? + deriv2(v, 1, y, py)? + deriv2(v, 0, z, pz)?) * nu;
     let visc_w = (deriv2(w, 2, x, px)? + deriv2(w, 1, y, py)? + deriv2(w, 0, z, pz)?) * nu;
 
-    // R = convection + pressure gradient − viscous diffusion
-    let res_x = (u * &du_dx) + (v * &du_dy) + (w * &du_dz) + dp_dx - visc_u;
-    let res_y = (u * &dv_dx) + (v * &dv_dy) + (w * &dv_dz) + dp_dy - visc_v;
-    let res_z = (u * &dw_dx) + (v * &dw_dy) + (w * &dw_dz) + dp_dz - visc_w;
+    // R = ∂(u_i u_j)/∂x_j + ∂p/∂x_i − ν ∇²u_i
+    // (Fortran sign: rsdu = visc - conv, then ∂u/∂t = rsdu - ∂p/∂x + headx)
+    let res_x = conv_u + dp_dx - visc_u;
+    let res_y = conv_v + dp_dy - visc_v;
+    let res_z = conv_w + dp_dz - visc_w;
 
     Ok((res_x, res_y, res_z))
 }
