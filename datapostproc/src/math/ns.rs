@@ -19,9 +19,10 @@ use hdf5::Error;
 
 /// First derivative of `f` along `axis` on a (possibly non-uniform) grid.
 ///
-/// * `periodic = false` – one-sided first-order difference at the two boundaries.
-/// * `periodic = true`  – second-order central difference that wraps around
-///   (assumes uniform spacing in the periodic direction, as is standard in DNS).
+/// All points use second-order 3-point stencils (requires n >= 3):
+/// * Interior points   – central difference (Lagrange).
+/// * `periodic = true` – boundary points wrap around (uniform spacing assumed).
+/// * `periodic = false`– boundary points use a second-order one-sided stencil.
 pub fn deriv1(
     f: &ArrayD<f64>,
     axis: usize,
@@ -38,16 +39,15 @@ pub fn deriv1(
         )
         .into());
     }
-    if n < 2 {
-        return Err(format!("need at least 2 points along axis {}", axis).into());
+    if n < 3 {
+        return Err(format!("need at least 3 points along axis {}", axis).into());
     }
 
     let mut df = f.to_owned();
     for i in 0..n {
         let slice = if i == 0 {
             if periodic {
-                // Wrap: left neighbour is f[n-1], right is f[1].
-                // Uniform spacing assumed for periodic directions.
+                // Wrap: left neighbour is f[n-1], right is f[1] (uniform spacing).
                 let dl = coords[1] - coords[0];
                 let dr = coords[1] - coords[0];
                 let fm = f.index_axis(Axis(axis), n - 1);
@@ -57,14 +57,22 @@ pub fn deriv1(
                     + &fc * ((dr - dl) / (dl * dr))
                     + &fp * (dl / (dr * (dl + dr)))
             } else {
+                // Second-order forward stencil through i=0,1,2 (Lagrange).
+                // f'(x0) = f0*(-(2h1+h2)/(h1*(h1+h2)))
+                //        + f1*((h1+h2)/(h1*h2))
+                //        + f2*(-h1/((h1+h2)*h2))
                 let f0 = f.index_axis(Axis(axis), 0);
                 let f1 = f.index_axis(Axis(axis), 1);
-                let dx = coords[1] - coords[0];
-                (&f1 - &f0) / dx
+                let f2 = f.index_axis(Axis(axis), 2);
+                let h1 = coords[1] - coords[0];
+                let h2 = coords[2] - coords[1];
+                &f0 * (-(2.0 * h1 + h2) / (h1 * (h1 + h2)))
+                    + &f1 * ((h1 + h2) / (h1 * h2))
+                    + &f2 * (-h1 / ((h1 + h2) * h2))
             }
         } else if i == n - 1 {
             if periodic {
-                // Wrap: left neighbour is f[n-2], right is f[0].
+                // Wrap: left neighbour is f[n-2], right is f[0] (uniform spacing).
                 let dl = coords[n - 1] - coords[n - 2];
                 let dr = coords[n - 1] - coords[n - 2];
                 let fm = f.index_axis(Axis(axis), n - 2);
@@ -74,10 +82,18 @@ pub fn deriv1(
                     + &fc * ((dr - dl) / (dl * dr))
                     + &fp * (dl / (dr * (dl + dr)))
             } else {
-                let fn1 = f.index_axis(Axis(axis), n - 1);
-                let fn2 = f.index_axis(Axis(axis), n - 2);
-                let dx = coords[n - 1] - coords[n - 2];
-                (&fn1 - &fn2) / dx
+                // Second-order backward stencil through i=n-3,n-2,n-1 (Lagrange).
+                // f'(x_{n-1}) = f_{n-3}*(h2/(h1*(h1+h2)))
+                //             + f_{n-2}*(-(h1+h2)/(h1*h2))
+                //             + f_{n-1}*((h1+2h2)/((h1+h2)*h2))
+                let f0 = f.index_axis(Axis(axis), n - 3);
+                let f1 = f.index_axis(Axis(axis), n - 2);
+                let f2 = f.index_axis(Axis(axis), n - 1);
+                let h1 = coords[n - 2] - coords[n - 3];
+                let h2 = coords[n - 1] - coords[n - 2];
+                &f0 * (h2 / (h1 * (h1 + h2)))
+                    + &f1 * (-(h1 + h2) / (h1 * h2))
+                    + &f2 * ((h1 + 2.0 * h2) / ((h1 + h2) * h2))
             }
         } else {
             let fm = f.index_axis(Axis(axis), i - 1);
@@ -298,14 +314,15 @@ mod tests {
 
     #[test]
     fn deriv1_nonperiodic_sin() {
-        let n = 100;
+        let n = 200;
         let x = linspace(0.0, 2.0 * std::f64::consts::PI, n);
         let f = x.mapv(f64::sin).into_dyn();
         let df = deriv1(&f, 0, &x, false).unwrap();
-        let max_err = (2..n - 2)
+        // All points (including boundaries) should be second-order accurate.
+        let max_err = (0..n)
             .map(|i| (df[IxDyn(&[i])] - x[i].cos()).abs())
             .fold(0.0_f64, f64::max);
-        assert!(max_err < 1e-3, "max interior error = {}", max_err);
+        assert!(max_err < 1e-3, "max error (incl. boundaries) = {}", max_err);
     }
 
     #[test]
