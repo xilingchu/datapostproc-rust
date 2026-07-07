@@ -4,12 +4,15 @@ use clap::{Args, Parser, Subcommand};
 use datapostproc_rust::data::H5File;
 use datapostproc_rust::hdf5::{Block, BlockValue, H5Data};
 use datapostproc_rust::math::avg::avg_to_profile;
+use datapostproc_rust::math::fik::{
+    fik_average, fik_decomposition, fik_decomposition_planes, FikDecomposition,
+};
 use datapostproc_rust::math::wall::{friction_velocity, wall_shear_stress};
 use datapostproc_rust::output::dat::write_dat;
 use datapostproc_rust::output::normalize::Profiles;
 use datapostproc_rust::output::xdmf::{write_xdmf, VarSpec};
 
-use ndarray::{Array1, Ix1};
+use ndarray::{s, Array1, ArrayD, Axis, Ix1};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -28,6 +31,8 @@ enum Command {
     Output(OutputArgs),
     /// Generate an XDMF file for Paraview.
     Hdfview(HdfviewArgs),
+    /// FIK skin-friction decomposition from a subavg HDF5 file.
+    Fik(FikArgs),
 }
 
 /// Hyperslab [start stride count block] for output (4 values, HDF5 convention).
@@ -104,6 +109,7 @@ fn main() {
     match cli.command {
         Command::Output(args) => run_output(args),
         Command::Hdfview(args) => run_hdfview(args),
+        Command::Fik(args) => run_fik(args),
     }
 }
 
@@ -261,6 +267,189 @@ fn run_hdfview(args: HdfviewArgs) {
         blockx, blocky, blockz,
         &var_specs,
     ).expect("Failed to write XDMF file");
+}
+
+// ─── fik sub-command ──────────────────────────────────────────────────────────
+
+#[derive(Args)]
+struct FikArgs {
+    /// Input subavg HDF5 file (raw: uu/uw are total second moments).
+    #[arg(short, long, value_name = "FILE")]
+    file: String,
+    /// Output .dat file (default: fik.dat).
+    #[arg(short, long, value_name = "FILE", default_value = "fik.dat")]
+    output: String,
+    /// Half-channel height h (default: 1.0).
+    #[arg(long, default_value_t = 1.0)]
+    half_height: f64,
+    /// Number of ghost cells to strip from each x-boundary (default: 1).
+    #[arg(long, default_value_t = 1usize)]
+    ghost_x: usize,
+    /// Number of (post-ghost-strip) points to drop from the start of the
+    /// x-range, e.g. to discard a corrupted lead-in.
+    #[arg(long, default_value_t = 0usize)]
+    trim_start: usize,
+    /// Number of (post-ghost-strip) points to drop from the end of the
+    /// x-range, e.g. to discard a corrupted tail.
+    #[arg(long, default_value_t = 0usize)]
+    trim_end: usize,
+    /// Treat streamwise direction as periodic for derivative stencils.
+    #[arg(long, default_value_t = false)]
+    periodic_x: bool,
+    /// Per-plane mode: one decomposition (and one output file `<output>_p<j>.dat`)
+    /// per spanwise plane, with the spanwise terms cf_turb_z/cf_conv_z retained.
+    #[arg(long, default_value_t = false)]
+    per_plane: bool,
+    /// Average over the given spanwise plane indices (comma-separated, e.g.
+    /// `--planes 2,5`).  Exact by linearity; spanwise terms do NOT cancel for
+    /// a subset of planes.  Writes a single output file.
+    #[arg(long, value_delimiter = ',')]
+    planes: Option<Vec<usize>>,
+}
+
+fn run_fik(args: FikArgs) {
+    let mut h5 = H5File::new(&args.file).expect("failed to open HDF5 file");
+    h5.get_info().expect("failed to read DNS info");
+    h5.load_coords().expect("failed to load coordinates");
+
+    let nu   = h5.info().nu.expect("'nu' not in HDF5 file");
+    let re_b = 1.0 / nu;
+
+    // Load 3-D fields helper
+    let load = |h5: &mut H5File, name: &str| -> ArrayD<f64> {
+        h5.add_dataset(name, None)
+          .unwrap_or_else(|e| panic!("dataset '{name}': {e}"));
+        match h5.dataset(name).unwrap().read_data::<f64>().unwrap() {
+            H5Data::Array(a) => a,
+            H5Data::Scalar(_) => panic!("'{name}' is scalar"),
+        }
+    };
+
+    let u_raw  = load(&mut h5, "u");
+    let v_raw  = load(&mut h5, "v");
+    let w_raw  = load(&mut h5, "w");
+    let p_raw  = load(&mut h5, "p");
+    let uu_raw = load(&mut h5, "uu");
+    let uw_raw = load(&mut h5, "uw");
+
+    // Strip ghost cells along x (axis 2)
+    let g = args.ghost_x;
+    let nx_ghost = u_raw.shape()[2];
+    let strip = |a: ArrayD<f64>| -> ArrayD<f64> {
+        a.slice_axis(Axis(2), (g..nx_ghost - g).into()).to_owned()
+    };
+    let u  = strip(u_raw);
+    let v  = strip(v_raw);
+    let w  = strip(w_raw);
+    let p  = strip(p_raw);
+    let uu = strip(uu_raw);
+    let uw = strip(uw_raw);
+
+    // Coordinates
+    let load_coord = |h5: &mut H5File, name: &str| -> Array1<f64> {
+        match h5.coord(name)
+            .unwrap_or_else(|| panic!("coord '{name}' not found"))
+            .read_data::<f64>().unwrap()
+        {
+            H5Data::Array(a) => a.into_dimensionality::<Ix1>().unwrap(),
+            H5Data::Scalar(_) => panic!("coord '{name}' is scalar"),
+        }
+    };
+    let x_full  = load_coord(&mut h5, "x");
+    let zc = load_coord(&mut h5, "zc");
+
+    // Trim a corrupted lead-in / tail from the streamwise range.
+    let nx_full = x_full.len();
+    let lo = args.trim_start;
+    let hi = nx_full - args.trim_end;
+    assert!(lo < hi, "trim_start ({lo}) must be < nx - trim_end ({hi})");
+    let trim = |a: ArrayD<f64>| -> ArrayD<f64> {
+        a.slice_axis(Axis(2), (lo..hi).into()).to_owned()
+    };
+    let u  = trim(u);
+    let v  = trim(v);
+    let w  = trim(w);
+    let p  = trim(p);
+    let uu = trim(uu);
+    let uw = trim(uw);
+    let x  = x_full.slice(s![lo..hi]).to_owned();
+
+    // Direct C_f from viscous sublayer: 2ν·u(iz=1) / zc[1]
+    let iz1 = 1usize;
+    // per spanwise plane j
+    let cf_direct_plane = |u: &ArrayD<f64>, j: usize| -> Array1<f64> {
+        u.slice(s![iz1, j, ..]).mapv(|uv| 2.0 * nu * uv / zc[iz1])
+    };
+    // spanwise-averaged
+    let cf_direct_mean: Array1<f64> = {
+        let u_ymean: Array1<f64> = u.slice(s![iz1, .., ..])
+            .mean_axis(ndarray::Axis(0))
+            .expect("mean over y");
+        u_ymean.mapv(|uv| 2.0 * nu * uv / zc[iz1])
+    };
+
+    // Write one decomposition (+ direct C_f) to a .dat file
+    let write_fik = |fik: &FikDecomposition, cf_direct: Array1<f64>, path: &str| {
+        let mut cols: HashMap<String, Array1<f64>> = HashMap::new();
+        cols.insert("x".into(),         x.clone());
+        cols.insert("cf_direct".into(), cf_direct);
+        cols.insert("cf_fik".into(),    fik.cf_total());
+        cols.insert("cf_lam".into(),    fik.cf_laminar.clone());
+        cols.insert("cf_center".into(), fik.cf_center.clone());
+        cols.insert("cf_turb_x".into(), fik.cf_turb_x.clone());
+        cols.insert("cf_turb_y".into(), fik.cf_turb_y.clone());
+        cols.insert("cf_turb_z".into(), fik.cf_turb_z.clone());
+        cols.insert("cf_conv_x".into(), fik.cf_conv_x.clone());
+        cols.insert("cf_conv_y".into(), fik.cf_conv_y.clone());
+        cols.insert("cf_conv_z".into(), fik.cf_conv_z.clone());
+        cols.insert("cf_diff_x".into(), fik.cf_diff_x.clone());
+        cols.insert("cf_diff_z".into(), fik.cf_diff_z.clone());
+        cols.insert("cf_source".into(), fik.cf_source.clone());
+        write_dat(Path::new(path), "x", re_b, &cols)
+            .expect("failed to write .dat file");
+        eprintln!("wrote {path}");
+    };
+
+    if args.per_plane || args.planes.is_some() {
+        // ── per-plane mode: spanwise terms retained ──────────────────────────
+        let uv = trim(strip(load(&mut h5, "uv")));
+        let y  = load_coord(&mut h5, "y");
+        let decs = fik_decomposition_planes(
+            &u, &v, &w, &p, &uu, &uv, &uw,
+            &x, &y, &zc,
+            re_b, args.half_height, args.periodic_x,
+        ).expect("fik_decomposition_planes failed");
+
+        if let Some(planes) = &args.planes {
+            // exact subset average over the selected planes
+            for &j in planes {
+                assert!(j < decs.len(), "plane index {j} out of range (ny={})", decs.len());
+            }
+            let sel: Vec<&FikDecomposition> = planes.iter().map(|&j| &decs[j]).collect();
+            let fik = fik_average(&sel).expect("fik_average failed");
+            let mut cf_dir = Array1::<f64>::zeros(x.len());
+            for &j in planes {
+                cf_dir = cf_dir + &cf_direct_plane(&u, j);
+            }
+            cf_dir /= planes.len() as f64;
+            write_fik(&fik, cf_dir, &args.output);
+        } else {
+            let stem = args.output.strip_suffix(".dat").unwrap_or(&args.output).to_string();
+            for (j, d) in decs.iter().enumerate() {
+                write_fik(d, cf_direct_plane(&u, j), &format!("{stem}_p{j}.dat"));
+            }
+        }
+    } else {
+        // ── spanwise-averaged mode (default) ─────────────────────────────────
+        let fik = fik_decomposition(
+            &u, &v, &w, &p, &uu, &uw,
+            &x, &zc,
+            re_b,
+            args.half_height,
+            args.periodic_x,
+        ).expect("fik_decomposition failed");
+        write_fik(&fik, cf_direct_mean, &args.output);
+    }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

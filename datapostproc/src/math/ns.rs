@@ -14,7 +14,7 @@
 ///   axis 1 (y, spanwise)    → true
 ///   axis 2 (x, streamwise)  → true
 
-use ndarray::{Array1, ArrayD, Axis};
+use ndarray::{Array1, Array3, ArrayD, Axis};
 use hdf5::Error;
 
 /// First derivative of `f` along `axis` on a (possibly non-uniform) grid.
@@ -284,6 +284,77 @@ pub fn ns_momentum_residual(
     Ok((res_x, res_y, res_z))
 }
 
+/// RANS momentum residual using the stored second-moment tensor ⟨u_i u_j⟩.
+///
+/// For a time-averaged (or phase-averaged) DNS field the full momentum balance is:
+///   ∂⟨u_i u_j⟩/∂x_j + ∂⟨p⟩/∂x_i − ν ∇²⟨u_i⟩ = 0  (steady mean flow)
+///
+/// where ⟨u_i u_j⟩ = ⟨u_i⟩⟨u_j⟩ + ⟨u_i' u_j'⟩ already contains both the
+/// mean-flow convection and the Reynolds-stress divergence.  Using the stored
+/// second moments directly avoids the need to split them.
+///
+/// # Arguments
+/// * `u`, `v`, `w`  – mean velocity components, shape `(nz, ny, nx)`
+/// * `p`            – mean pressure
+/// * `uu`,`uv`,`uw`,`vv`,`vw`,`ww` – total second moments ⟨u_i u_j⟩, same shape
+/// * `x`, `y`, `z`  – coordinate arrays
+/// * `nu`           – kinematic viscosity
+/// * `periodic`     – `[z_periodic, y_periodic, x_periodic]`
+///
+/// # Returns
+/// `(res_x, res_y, res_z)` – RANS residual arrays; near-zero means the
+/// time-averaged momentum budget closes.
+#[allow(clippy::too_many_arguments)]
+pub fn rans_momentum_residual(
+    u:  &ArrayD<f64>,
+    v:  &ArrayD<f64>,
+    w:  &ArrayD<f64>,
+    p:  &ArrayD<f64>,
+    uu: &ArrayD<f64>,
+    uv: &ArrayD<f64>,
+    uw: &ArrayD<f64>,
+    vv: &ArrayD<f64>,
+    vw: &ArrayD<f64>,
+    ww: &ArrayD<f64>,
+    x: &Array1<f64>,
+    y: &Array1<f64>,
+    z: &Array1<f64>,
+    nu: f64,
+    periodic: [bool; 3],
+) -> Result<(ArrayD<f64>, ArrayD<f64>, ArrayD<f64>), Error> {
+    let shape = u.shape();
+    for (name, arr) in [("v",v),("w",w),("p",p),
+                        ("uu",uu),("uv",uv),("uw",uw),
+                        ("vv",vv),("vw",vw),("ww",ww)] {
+        if arr.shape() != shape {
+            return Err(format!("'{}' shape {:?} != u shape {:?}", name, arr.shape(), shape).into());
+        }
+    }
+
+    let (pz, py, px) = (periodic[0], periodic[1], periodic[2]);
+
+    // Divergence of total stress tensor ∂⟨u_i u_j⟩/∂x_j
+    let conv_u = deriv1(uu, 2, x, px)? + deriv1(uv, 1, y, py)? + deriv1(uw, 0, z, pz)?;
+    let conv_v = deriv1(uv, 2, x, px)? + deriv1(vv, 1, y, py)? + deriv1(vw, 0, z, pz)?;
+    let conv_w = deriv1(uw, 2, x, px)? + deriv1(vw, 1, y, py)? + deriv1(ww, 0, z, pz)?;
+
+    // Pressure gradients
+    let dp_dx = deriv1(p, 2, x, px)?;
+    let dp_dy = deriv1(p, 1, y, py)?;
+    let dp_dz = deriv1(p, 0, z, pz)?;
+
+    // Viscous diffusion of mean flow
+    let visc_u = (deriv2(u, 2, x, px)? + deriv2(u, 1, y, py)? + deriv2(u, 0, z, pz)?) * nu;
+    let visc_v = (deriv2(v, 2, x, px)? + deriv2(v, 1, y, py)? + deriv2(v, 0, z, pz)?) * nu;
+    let visc_w = (deriv2(w, 2, x, px)? + deriv2(w, 1, y, py)? + deriv2(w, 0, z, pz)?) * nu;
+
+    let res_x = conv_u + dp_dx - visc_u;
+    let res_y = conv_v + dp_dy - visc_v;
+    let res_z = conv_w + dp_dz - visc_w;
+
+    Ok((res_x, res_y, res_z))
+}
+
 /// L2 norm of the N-S residual: `sqrt(mean(R_x² + R_y² + R_z²))`.
 ///
 /// A single scalar quantifying how well momentum is conserved across the domain.
@@ -303,6 +374,222 @@ pub fn ns_residual_l2(
         .map(|((rx, ry), rz)| rx * rx + ry * ry + rz * rz)
         .sum();
     Ok((sum_sq / n as f64).sqrt())
+}
+
+/// N-S momentum residual using the **exact Fortran `lineStep` stencil**.
+///
+/// Matches `mod_solver.f90 :: lineStep` exactly:
+/// - Convection: face-interpolated skew-symmetric form
+///     `conv_u = 0.25*((u_i+u_{i+1})^2 − (u_{i-1}+u_i)^2)*d1xp + …`
+/// - Viscosity: 3-point non-uniform Laplacian
+///     `visc_u = (due*d2xp − duw*d2xm + …)*ν`
+/// - Pressure: one-sided face difference
+///     `dp/dx = (p_{i+1}−p_i)*d1x`
+///
+/// # Grid layout (inst_400000 files)
+/// ```text
+///   u, v, w, p : shape (nz=276, ny=384, nx_f=801)
+///   x          : 800 cell-centre x-coords  (uniform, Δx = x[0])
+///   y          : 384 cell-centre y-coords  (uniform, periodic, Δy = y[0])
+///   zc         : 276 z-face positions      (zc[0]=0=bottom wall, zc[275]=2=top wall)
+///   zd         : 551 interleaved z dual-grid (zd[2k]=zc[k], zd[2k+1]=cell-centre_k)
+/// ```
+///
+/// # Returns
+/// `(res_u, res_v, res_w)` with shape `(nz_int=273, ny=384, nx_int=799)`.
+/// Interior only: `iz = 1..273`, `ix = 1..799`, all `iy` (periodic y).
+/// `res_w[iz,…]` is the w-residual at z-face `iz+1`.
+///
+/// # Sign convention
+/// `R = conv + grad_p − ν∇²u = headx − ∂u/∂t`
+pub fn ns_residual_fortran_stencil(
+    u:  &ArrayD<f64>, v: &ArrayD<f64>, w: &ArrayD<f64>, p: &ArrayD<f64>,
+    x:  &Array1<f64>, y: &Array1<f64>,
+    zc: &Array1<f64>, zd: &Array1<f64>,
+    nu: f64,
+) -> Result<(Array3<f64>, Array3<f64>, Array3<f64>), Error> {
+    let nz  = u.shape()[0];   // 276
+    let ny  = u.shape()[1];   // 384
+    let nxf = u.shape()[2];   // 801 (includes right ghost)
+    let nx  = x.len();        // 800
+
+    if nxf < nx + 1 {
+        return Err("u x-dimension must be nx+1 (one right ghost cell)".into());
+    }
+    if zc.len() != nz || zd.len() != 2 * (nz - 1) + 1 {
+        return Err(format!(
+            "zc must have {} entries, zd must have {} entries; got {} and {}",
+            nz, 2*(nz-1)+1, zc.len(), zd.len()
+        ).into());
+    }
+
+    // Uniform x spacing
+    let dx  = x[1] - x[0];
+    let d1x = 1.0 / dx;           // d1x = d1xp = d1xm  (uniform grid)
+    let d2x = d1x * d1x;          // d2xp = d2xm
+
+    // Uniform y spacing (periodic)
+    let dy  = y[1] - y[0];
+    let d1y = 1.0 / dy;
+    let d2y = d1y * d1y;
+
+    // z-coefficients for cells iz = 0..nz-2  (= 0..274, nz-1 = 275 cells)
+    // zc[k] = face k (k=0..275), zd[2k] = zc[k], zd[2k+1] = cell-centre k
+    let ncells = nz - 1;   // 275
+
+    // d1z[k]  = 1 / cell_width[k]  = 1 / (zc[k+1] - zc[k])
+    let d1z: Vec<f64> = (0..ncells).map(|k| 1.0 / (zc[k + 1] - zc[k])).collect();
+
+    // d1zp_uv[k] = 1 / (cellctr[k+1] - cellctr[k])  for u/v viscosity (k=0..ncells-2)
+    // d1zm_uv[k] = 1 / (cellctr[k]   - cellctr[k-1]) for u/v viscosity (k=1..ncells-1)
+    // Stored d1zm_uv[j] = d1zm at cell j+1 so j=0..ncells-2 covers k=1..ncells-1
+    let d1zp_uv: Vec<f64> = (0..ncells - 1).map(|k| 1.0 / (zd[2*k + 3] - zd[2*k + 1])).collect();
+    let d1zm_uv: Vec<f64> = (1..ncells    ).map(|k| 1.0 / (zd[2*k + 1] - zd[2*k - 1])).collect();
+    // d2zp_uv[k] = d1z[k] * d1zp_uv[k]  (k=0..ncells-2)
+    // d2zm_uv[k] = d1z[k] * d1zm_uv[k-1] (k=1..ncells-1, so index shift)
+    let d2zp_uv: Vec<f64> = (0..ncells - 1).map(|k| d1z[k] * d1zp_uv[k]).collect();
+    let d2zm_uv: Vec<f64> = (1..ncells    ).map(|k| d1z[k] * d1zm_uv[k - 1]).collect();
+
+    // z-coefficients for w at face iz (iz=1..ncells-1 = 1..274):
+    // d1zp_w[iz] = 1 / (cellctr[iz] - cellctr[iz-1])  = 1 / (zd[2iz+1] - zd[2iz-1])
+    // d2zpp_w[iz] = d1zp_w[iz] * d1z[iz]      (cell above face iz)
+    // d2zpm_w[iz] = d1zp_w[iz] * d1z[iz-1]    (cell below face iz)
+    // stored at index iz-1 → range 0..ncells-2
+
+    // Interior output region: iz=1..273, iy=0..ny-1, ix=1..799
+    let nz_out = 273usize;   // iz = 1..273 (inclusive)
+    let nx_out = nx - 1;     // ix = 1..799
+
+    let mut rx = Array3::<f64>::zeros((nz_out, ny, nx_out));
+    let mut ry = Array3::<f64>::zeros((nz_out, ny, nx_out));
+    let mut rz = Array3::<f64>::zeros((nz_out, ny, nx_out));
+
+    for iz in 1usize..=nz_out {          // iz = 1..273  (cell index for u/v, face index for w)
+        let oz = iz - 1;                 // output z index 0..272
+
+        // u/v z-coefficients at cell iz (iz=1..273, safe: d2zp_uv goes 0..273, d2zm_uv goes 0..273)
+        let d2zp_uv_k = d2zp_uv[iz];        // iz <= 273 < ncells-1=274 ✓
+        let d2zm_uv_k = d2zm_uv[iz - 1];    // iz-1 <= 272, d2zm_uv has ncells-1=274 entries ✓
+
+        // w z-coefficients at face iz (stored at index iz-1)
+        let d1zp_w  = 1.0 / (zd[2 * iz + 1] - zd[2 * iz - 1]);
+        let d2zpp_w = d1zp_w * d1z[iz];
+        let d2zpm_w = d1zp_w * d1z[iz - 1];
+        let d1z_w   = d1zp_w;  // conv_w z-term uses d1zp (face-to-face)
+
+        for iy in 0..ny {
+            let iy_p = (iy + 1) % ny;
+            let iy_m = (iy + ny - 1) % ny;
+
+            for ix in 1..nx {            // ix = 1..799
+                let ox = ix - 1;         // output x index 0..798
+
+                // ── u-equation ──────────────────────────────────────────────────
+                // Face interpolated velocities (each is sum of two adjacent values = 2×face_value)
+                let ue  = u[[iz, iy,   ix    ]] + u[[iz, iy,   ix + 1]];
+                let uw_ = u[[iz, iy,   ix - 1]] + u[[iz, iy,   ix    ]];
+                let uh  = u[[iz, iy,   ix    ]] + u[[iz, iy_p, ix    ]];
+                let uq  = u[[iz, iy_m, ix    ]] + u[[iz, iy,   ix    ]];
+                let un  = u[[iz, iy,   ix    ]] + u[[iz + 1, iy, ix  ]];
+                let us_ = u[[iz, iy,   ix    ]] + u[[iz - 1, iy, ix  ]];
+
+                let vh  = v[[iz, iy,   ix    ]] + v[[iz, iy,   ix + 1]];
+                let vq  = v[[iz, iy_m, ix    ]] + v[[iz, iy_m, ix + 1]];
+                let wn  = w[[iz, iy,   ix    ]] + w[[iz, iy,   ix + 1]];
+                let ws_ = w[[iz - 1, iy, ix  ]] + w[[iz - 1, iy, ix + 1]];
+
+                let conv_u = 0.25 * (ue * ue - uw_ * uw_) * d1x
+                           + 0.25 * (uh * vh - uq * vq)   * d1y
+                           + 0.25 * (un * wn - us_ * ws_) * d1z[iz];
+
+                let due = u[[iz, iy,   ix + 1]] - u[[iz, iy,   ix    ]];
+                let duw = u[[iz, iy,   ix    ]] - u[[iz, iy,   ix - 1]];
+                let duh = u[[iz, iy_p, ix    ]] - u[[iz, iy,   ix    ]];
+                let duq = u[[iz, iy,   ix    ]] - u[[iz, iy_m, ix    ]];
+                let dun = u[[iz + 1, iy, ix  ]] - u[[iz, iy,   ix    ]];
+                let dus = u[[iz, iy,   ix    ]] - u[[iz - 1, iy, ix  ]];
+
+                let visc_u = (due * d2x - duw * d2x
+                            + duh * d2y - duq * d2y
+                            + dun * d2zp_uv_k - dus * d2zm_uv_k) * nu;
+
+                let dp_dx = (p[[iz, iy, ix + 1]] - p[[iz, iy, ix]]) * d1x;
+
+                rx[[oz, iy, ox]] = conv_u + dp_dx - visc_u;
+
+                // ── v-equation ──────────────────────────────────────────────────
+                let ve  = v[[iz, iy,   ix    ]] + v[[iz, iy,   ix + 1]];
+                let vw_ = v[[iz, iy,   ix - 1]] + v[[iz, iy,   ix    ]];
+                let vh2 = v[[iz, iy,   ix    ]] + v[[iz, iy_p, ix    ]];
+                let vq2 = v[[iz, iy_m, ix    ]] + v[[iz, iy,   ix    ]];
+                let vn  = v[[iz, iy,   ix    ]] + v[[iz + 1, iy, ix  ]];
+                let vs_ = v[[iz, iy,   ix    ]] + v[[iz - 1, iy, ix  ]];
+
+                // Cross terms for v-conv: u interpolated to top y-face, w interpolated to top y-face
+                let ue_v = u[[iz, iy,   ix    ]] + u[[iz, iy_p, ix    ]];
+                let uw_v = u[[iz, iy,   ix - 1]] + u[[iz, iy_p, ix - 1]];
+                let wn_v = w[[iz, iy,   ix    ]] + w[[iz, iy_p, ix    ]];
+                let ws_v = w[[iz - 1, iy, ix  ]] + w[[iz - 1, iy_p, ix]];
+
+                let conv_v = 0.25 * (ue_v * ve - uw_v * vw_) * d1x
+                           + 0.25 * (vh2 * vh2 - vq2 * vq2)  * d1y
+                           + 0.25 * (wn_v * vn - ws_v * vs_) * d1z[iz];
+
+                let dve = v[[iz, iy,   ix + 1]] - v[[iz, iy,   ix    ]];
+                let dvw = v[[iz, iy,   ix    ]] - v[[iz, iy,   ix - 1]];
+                let dvh = v[[iz, iy_p, ix    ]] - v[[iz, iy,   ix    ]];
+                let dvq = v[[iz, iy,   ix    ]] - v[[iz, iy_m, ix    ]];
+                let dvn = v[[iz + 1, iy, ix  ]] - v[[iz, iy,   ix    ]];
+                let dvs = v[[iz, iy,   ix    ]] - v[[iz - 1, iy, ix  ]];
+
+                let visc_v = (dve * d2x - dvw * d2x
+                            + dvh * d2y - dvq * d2y
+                            + dvn * d2zp_uv_k - dvs * d2zm_uv_k) * nu;
+
+                let dp_dy = (p[[iz, iy_p, ix]] - p[[iz, iy, ix]]) * d1y;
+
+                ry[[oz, iy, ox]] = conv_v + dp_dy - visc_v;
+
+                // ── w-equation  (w at z-face iz, between cells iz-1 and iz) ────
+                let we  = w[[iz, iy,   ix    ]] + w[[iz, iy,   ix + 1]];
+                let ww_ = w[[iz, iy,   ix - 1]] + w[[iz, iy,   ix    ]];
+                let wh  = w[[iz, iy,   ix    ]] + w[[iz, iy_p, ix    ]];
+                let wq  = w[[iz, iy_m, ix    ]] + w[[iz, iy,   ix    ]];
+                let wn2 = w[[iz, iy,   ix    ]] + w[[iz + 1, iy, ix  ]];
+                let ws2 = w[[iz, iy,   ix    ]] + w[[iz - 1, iy, ix  ]];
+
+                // Cross terms for w: u and v interpolated to z-face iz
+                let ue_w = u[[iz, iy,   ix    ]] + u[[iz + 1, iy,   ix    ]];
+                let uw_w = u[[iz, iy,   ix - 1]] + u[[iz + 1, iy,   ix - 1]];
+                let vh_w = v[[iz, iy,   ix    ]] + v[[iz + 1, iy,   ix    ]];
+                let vq_w = v[[iz, iy_m, ix    ]] + v[[iz + 1, iy_m, ix    ]];
+
+                // NOTE: w-conv uses d1xm, d1ym, d1zp (different from u-conv)
+                // For uniform x,y: d1xm=d1x, d1ym=d1y; so only d1zp differs
+                let conv_w = 0.25 * (ue_w * we - uw_w * ww_) * d1x
+                           + 0.25 * (vh_w * wh - vq_w * wq)  * d1y
+                           + 0.25 * (wn2 * wn2 - ws2 * ws2)  * d1z_w;
+
+                let dwe = w[[iz, iy,   ix + 1]] - w[[iz, iy,   ix    ]];
+                let dww = w[[iz, iy,   ix    ]] - w[[iz, iy,   ix - 1]];
+                let dwh = w[[iz, iy_p, ix    ]] - w[[iz, iy,   ix    ]];
+                let dwq = w[[iz, iy,   ix    ]] - w[[iz, iy_m, ix    ]];
+                let dwn = w[[iz + 1, iy, ix  ]] - w[[iz, iy,   ix    ]];
+                let dws = w[[iz, iy,   ix    ]] - w[[iz - 1, iy, ix  ]];
+
+                // w viscosity uses d2zpp/d2zpm (staggered z second-derivative)
+                let visc_w = (dwe * d2x   - dww * d2x
+                            + dwh * d2y   - dwq * d2y
+                            + dwn * d2zpp_w - dws * d2zpm_w) * nu;
+
+                let dp_dz = (p[[iz + 1, iy, ix]] - p[[iz, iy, ix]]) * d1zp_w;
+
+                rz[[oz, iy, ox]] = conv_w + dp_dz - visc_w;
+            }
+        }
+    }
+
+    Ok((rx, ry, rz))
 }
 
 #[cfg(test)]
