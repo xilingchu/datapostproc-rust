@@ -4,12 +4,13 @@ use clap::{Args, Parser, Subcommand};
 use datapostproc_rust::data::H5File;
 use datapostproc_rust::hdf5::{Block, BlockValue, H5Data};
 use datapostproc_rust::math::avg::avg_to_profile;
+use datapostproc_rust::math::spectrum::SpanwiseSpectrum;
 use datapostproc_rust::math::wall::{friction_velocity, wall_shear_stress};
 use datapostproc_rust::output::dat::write_dat;
 use datapostproc_rust::output::normalize::Profiles;
 use datapostproc_rust::output::xdmf::{write_xdmf, VarSpec};
 
-use ndarray::{Array1, Ix1};
+use ndarray::{Array1, ArrayD, Axis, Ix1};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -28,6 +29,9 @@ enum Command {
     Output(OutputArgs),
     /// Generate an XDMF file for Paraview.
     Hdfview(HdfviewArgs),
+    /// Spanwise energy spectra and two-point correlations from
+    /// instantaneous snapshots.
+    Spectra(SpectraArgs),
 }
 
 /// Hyperslab [start stride count block] for output (4 values, HDF5 convention).
@@ -97,6 +101,27 @@ struct HdfviewArgs {
     block: ViewBlockArgs,
 }
 
+#[derive(Args)]
+struct SpectraArgs {
+    /// Instantaneous snapshot HDF5 files; all are ensemble-averaged together.
+    #[arg(short, long, num_args = 1.., value_name = "FILE")]
+    files: Vec<String>,
+    /// Dataset name to analyse (u, v, w, p, …).
+    #[arg(short, long, default_value = "u")]
+    variable: String,
+    /// Output stem: writes <stem>_spec.dat and <stem>_corr.dat.
+    #[arg(short, long, default_value = "spectra")]
+    output: String,
+    /// x-index range START END (0-based, half-open, indices of the x
+    /// coordinate array) to average over; default: full streamwise extent.
+    #[arg(long, num_args = 2, value_name = "INT")]
+    xrange: Option<Vec<usize>>,
+    /// Wall-normal locations (physical z, wall at 0) written as columns;
+    /// each is snapped to the nearest grid point.
+    #[arg(long, value_delimiter = ',', default_value = "0.05,0.1,0.2,0.5,1.0")]
+    zloc: Vec<f64>,
+}
+
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 fn main() {
@@ -104,6 +129,7 @@ fn main() {
     match cli.command {
         Command::Output(args) => run_output(args),
         Command::Hdfview(args) => run_hdfview(args),
+        Command::Spectra(args) => run_spectra(args),
     }
 }
 
@@ -261,6 +287,146 @@ fn run_hdfview(args: HdfviewArgs) {
         blockx, blocky, blockz,
         &var_specs,
     ).expect("Failed to write XDMF file");
+}
+
+// ─── spectra sub-command ──────────────────────────────────────────────────────
+
+fn run_spectra(args: SpectraArgs) {
+    assert!(!args.files.is_empty(), "need at least one snapshot file");
+
+    let read_coord = |h5: &H5File, name: &str| -> Array1<f64> {
+        match h5
+            .coord(name)
+            .unwrap_or_else(|| panic!("coord '{name}' not found"))
+            .read_data::<f64>()
+            .unwrap()
+        {
+            H5Data::Array(a) => a.into_dimensionality::<Ix1>().unwrap(),
+            H5Data::Scalar(_) => panic!("coord '{name}' is scalar"),
+        }
+    };
+
+    // ── coordinates / metadata from the first snapshot ────────────────────────
+    let (y, zc, x, nu) = {
+        let mut h5 = H5File::new(&args.files[0]).expect("failed to open first file");
+        h5.get_info().expect("failed to read DNS info");
+        h5.load_coords().expect("failed to load coordinates");
+        let nu = h5.info().nu.expect("'nu' not in HDF5 file");
+        (
+            read_coord(&h5, "y"),
+            read_coord(&h5, "zc"),
+            read_coord(&h5, "x"),
+            nu,
+        )
+    };
+    let ny = y.len();
+    let nxc = x.len();
+
+    // spanwise grid must be uniform (plain FFT, no windowing)
+    let dy = y[1] - y[0];
+    for j in 1..ny {
+        assert!(
+            ((y[j] - y[j - 1]) - dy).abs() < 1e-8 * dy,
+            "spanwise grid is not uniform at j={j}"
+        );
+    }
+    let ly = dy * ny as f64;
+
+    let (x0, x1) = match &args.xrange {
+        Some(v) => (v[0], v[1]),
+        None => (0, nxc),
+    };
+    assert!(x0 < x1 && x1 <= nxc, "invalid --xrange {x0} {x1} (nx = {nxc})");
+
+    // ── accumulate all snapshots ──────────────────────────────────────────────
+    let mut spec: Option<SpanwiseSpectrum> = None;
+
+    for path in &args.files {
+        let mut h5 = H5File::new(path).expect("failed to open HDF5 file");
+        h5.add_dataset(&args.variable, None)
+            .unwrap_or_else(|e| panic!("dataset '{}' in {path}: {e}", args.variable));
+        let raw = match h5
+            .dataset(&args.variable)
+            .unwrap()
+            .read_data::<f64>()
+            .unwrap()
+        {
+            H5Data::Array(a) => a,
+            H5Data::Scalar(_) => panic!("'{}' is scalar", args.variable),
+        };
+
+        // Align the streamwise extent with the x coordinate array:
+        //   nxf == nxc      already aligned
+        //   nxf == nxc + 1  inst convention: one extra outflow column at the end
+        //   nxf == nxc + 2  subavg convention: one ghost column on each side
+        let nxf = raw.shape()[2];
+        let aligned: ArrayD<f64> = match nxf.checked_sub(nxc) {
+            Some(0) => raw,
+            Some(1) => raw.slice_axis(Axis(2), (0..nxc).into()).to_owned(),
+            Some(2) => raw.slice_axis(Axis(2), (1..nxc + 1).into()).to_owned(),
+            _ => panic!("field x extent {nxf} incompatible with x coord length {nxc}"),
+        };
+        let window = aligned.slice_axis(Axis(2), (x0..x1).into()).to_owned();
+
+        let acc = spec.get_or_insert_with(|| {
+            SpanwiseSpectrum::new(window.shape()[0], ny, ly).expect("SpanwiseSpectrum::new")
+        });
+        acc.accumulate(&window).expect("accumulate failed");
+        eprintln!("accumulated {path}");
+    }
+
+    let spec = spec.unwrap();
+    let nz = zc.len();
+
+    // ── map requested z locations to grid points (deduplicated) ───────────────
+    let mut z_indices: Vec<usize> = Vec::new();
+    for &zq in &args.zloc {
+        let iz = (0..nz)
+            .min_by(|&a, &b| {
+                (zc[a] - zq).abs().partial_cmp(&(zc[b] - zq).abs()).unwrap()
+            })
+            .unwrap();
+        if !z_indices.contains(&iz) {
+            z_indices.push(iz);
+        }
+    }
+
+    // ── write outputs ─────────────────────────────────────────────────────────
+    let stem = args.output.strip_suffix(".dat").unwrap_or(&args.output);
+    let ret = 1.0 / nu;
+
+    let (k, e) = spec.energy_spectrum().expect("energy_spectrum");
+    let mut cols: HashMap<String, Array1<f64>> = HashMap::new();
+    cols.insert("yk".into(), k);
+    for &iz in &z_indices {
+        cols.insert(
+            format!("e{}_{:.3}", args.variable, zc[iz]),
+            e.row(iz).to_owned(),
+        );
+    }
+    let spec_path = format!("{stem}_spec.dat");
+    write_dat(Path::new(&spec_path), "yk", ret, &cols).expect("failed to write spectrum");
+    eprintln!("wrote {spec_path}");
+
+    let (r, rho) = spec.correlation().expect("correlation");
+    let mut cols: HashMap<String, Array1<f64>> = HashMap::new();
+    cols.insert("ydel".into(), r);
+    for &iz in &z_indices {
+        cols.insert(
+            format!("r{}_{:.3}", args.variable, zc[iz]),
+            rho.row(iz).to_owned(),
+        );
+    }
+    let corr_path = format!("{stem}_corr.dat");
+    write_dat(Path::new(&corr_path), "ydel", ret, &cols).expect("failed to write correlation");
+    eprintln!("wrote {corr_path}");
+
+    eprintln!(
+        "ensemble: {} snapshot(s) x {} x-columns = {} y-lines per z",
+        args.files.len(),
+        x1 - x0,
+        spec.samples()
+    );
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

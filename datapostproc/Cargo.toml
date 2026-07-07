@@ -12,3 +12,4 @@ clap = { version = '=4.5.32', features = ["derive"] }
 hdf5 = { package = "hdf5-metno", version = "0.12.4", features = ["blosc"]}
 #internal
 macro-struct = { workspace = true }
+rustfft = "6.4.1"
