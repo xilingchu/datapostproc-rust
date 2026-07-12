@@ -7,6 +7,7 @@ use datapostproc_rust::math::avg::avg_to_profile;
 use datapostproc_rust::math::fik::{
     fik_average, fik_decomposition, fik_decomposition_planes, FikDecomposition,
 };
+use datapostproc_rust::math::rd::rd_decomposition;
 use datapostproc_rust::math::spectrum::SpanwiseSpectrum;
 use datapostproc_rust::math::wall::{friction_velocity, wall_shear_stress};
 use datapostproc_rust::output::dat::write_dat;
@@ -37,6 +38,9 @@ enum Command {
     Spectra(SpectraArgs),
     /// FIK skin-friction decomposition from a subavg HDF5 file.
     Fik(FikArgs),
+    /// Renard–Deck (energy-budget) skin-friction decomposition from a
+    /// subavg HDF5 file.
+    Rd(RdArgs),
 }
 
 /// Hyperslab [start stride count block] for output (4 values, HDF5 convention).
@@ -136,6 +140,7 @@ fn main() {
         Command::Hdfview(args) => run_hdfview(args),
         Command::Spectra(args) => run_spectra(args),
         Command::Fik(args) => run_fik(args),
+        Command::Rd(args) => run_rd(args),
     }
 }
 
@@ -616,6 +621,129 @@ fn run_fik(args: FikArgs) {
         ).expect("fik_decomposition failed");
         write_fik(&fik, cf_direct_mean, &args.output);
     }
+}
+
+// ─── rd sub-command ───────────────────────────────────────────────────────────
+
+#[derive(Args)]
+struct RdArgs {
+    /// Input subavg HDF5 file (raw: uu/uw are total second moments).
+    #[arg(short, long, value_name = "FILE")]
+    file: String,
+    /// Output .dat file (default: rd.dat).
+    #[arg(short, long, value_name = "FILE", default_value = "rd.dat")]
+    output: String,
+    /// Half-channel height h (default: 1.0).
+    #[arg(long, default_value_t = 1.0)]
+    half_height: f64,
+    /// Reference velocity U_ref of the RD energy frame; C_f = 2τ_w/U_ref².
+    /// Default 1.0 = global bulk velocity in DNS units (matches direct C_f).
+    #[arg(long, default_value_t = 1.0)]
+    u_ref: f64,
+    /// Number of ghost cells to strip from each x-boundary (default: 1).
+    #[arg(long, default_value_t = 1usize)]
+    ghost_x: usize,
+    /// Number of (post-ghost-strip) points to drop from the start of the
+    /// x-range, e.g. to discard a corrupted lead-in.
+    #[arg(long, default_value_t = 0usize)]
+    trim_start: usize,
+    /// Number of (post-ghost-strip) points to drop from the end of the
+    /// x-range, e.g. to discard a corrupted tail.
+    #[arg(long, default_value_t = 0usize)]
+    trim_end: usize,
+    /// Treat streamwise direction as periodic for derivative stencils.
+    #[arg(long, default_value_t = false)]
+    periodic_x: bool,
+}
+
+fn run_rd(args: RdArgs) {
+    let mut h5 = H5File::new(&args.file).expect("failed to open HDF5 file");
+    h5.get_info().expect("failed to read DNS info");
+    h5.load_coords().expect("failed to load coordinates");
+
+    let nu   = h5.info().nu.expect("'nu' not in HDF5 file");
+    let re_b = 1.0 / nu;
+
+    let load = |h5: &mut H5File, name: &str| -> ArrayD<f64> {
+        h5.add_dataset(name, None)
+          .unwrap_or_else(|e| panic!("dataset '{name}': {e}"));
+        match h5.dataset(name).unwrap().read_data::<f64>().unwrap() {
+            H5Data::Array(a) => a,
+            H5Data::Scalar(_) => panic!("'{name}' is scalar"),
+        }
+    };
+
+    let u_raw  = load(&mut h5, "u");
+    let w_raw  = load(&mut h5, "w");
+    let p_raw  = load(&mut h5, "p");
+    let uu_raw = load(&mut h5, "uu");
+    let uw_raw = load(&mut h5, "uw");
+
+    // Strip ghost cells along x (axis 2), then trim a corrupted lead-in/tail.
+    let g = args.ghost_x;
+    let nx_ghost = u_raw.shape()[2];
+    let load_coord = |h5: &mut H5File, name: &str| -> Array1<f64> {
+        match h5.coord(name)
+            .unwrap_or_else(|| panic!("coord '{name}' not found"))
+            .read_data::<f64>().unwrap()
+        {
+            H5Data::Array(a) => a.into_dimensionality::<Ix1>().unwrap(),
+            H5Data::Scalar(_) => panic!("coord '{name}' is scalar"),
+        }
+    };
+    let x_full = load_coord(&mut h5, "x");
+    let zc     = load_coord(&mut h5, "zc");
+
+    let nx_full = x_full.len();
+    let lo = args.trim_start;
+    let hi = nx_full - args.trim_end;
+    assert!(lo < hi, "trim_start ({lo}) must be < nx - trim_end ({hi})");
+
+    let cut = |a: ArrayD<f64>| -> ArrayD<f64> {
+        let stripped = a.slice_axis(Axis(2), (g..nx_ghost - g).into()).to_owned();
+        stripped.slice_axis(Axis(2), (lo..hi).into()).to_owned()
+    };
+    let u  = cut(u_raw);
+    let w  = cut(w_raw);
+    let p  = cut(p_raw);
+    let uu = cut(uu_raw);
+    let uw = cut(uw_raw);
+    let x  = x_full.slice(s![lo..hi]).to_owned();
+
+    // Direct C_f from viscous sublayer: 2ν·u(iz=1) / zc[1]
+    let iz1 = 1usize;
+    let cf_direct: Array1<f64> = {
+        let u_ymean: Array1<f64> = u.slice(s![iz1, .., ..])
+            .mean_axis(ndarray::Axis(0))
+            .expect("mean over y");
+        u_ymean.mapv(|uv| 2.0 * nu * uv / zc[iz1])
+    };
+
+    let rd = rd_decomposition(
+        &u, &w, &p, &uu, &uw,
+        &x, &zc,
+        re_b,
+        args.half_height,
+        args.u_ref,
+        args.periodic_x,
+    ).expect("rd_decomposition failed");
+
+    let mut cols: HashMap<String, Array1<f64>> = HashMap::new();
+    cols.insert("x".into(),         x.clone());
+    cols.insert("cf_direct".into(), cf_direct);
+    cols.insert("cf_rd".into(),     rd.cf_total());
+    cols.insert("cf_diss".into(),   rd.cf_diss.clone());
+    cols.insert("cf_prod".into(),   rd.cf_prod.clone());
+    cols.insert("cf_growth".into(), rd.cf_growth());
+    cols.insert("cf_conv_x".into(), rd.cf_conv_x.clone());
+    cols.insert("cf_conv_y".into(), rd.cf_conv_y.clone());
+    cols.insert("cf_turb_x".into(), rd.cf_turb_x.clone());
+    cols.insert("cf_diff_x".into(), rd.cf_diff_x.clone());
+    cols.insert("cf_source".into(), rd.cf_source.clone());
+    cols.insert("cf_center".into(), rd.cf_center.clone());
+    write_dat(Path::new(&args.output), "x", re_b, &cols)
+        .expect("failed to write .dat file");
+    eprintln!("wrote {}", args.output);
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

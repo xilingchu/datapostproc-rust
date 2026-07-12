@@ -328,29 +328,13 @@ fn fik_half_channel(
     periodic_x: bool,
 ) -> Result<FikDecomposition, Error> {
     let nx = x.len();
-    let nz = zc.len();
 
     // ── Step 4: restrict to the bottom half  zc ≤ h ───────────────────────────
     // The half-channel grid is extended with one row linearly interpolated to
     // z = h exactly, so that centreline boundary values (u'w'|_h, (ū·w̄)|_h,
     // ∂ū/∂z|_h) are available even when control makes the flow asymmetric.
-    let n_half = zc.iter().position(|&z| z > h).unwrap_or(nz);
-    if n_half < 2 {
-        return Err(format!(
-            "fewer than 2 wall-normal points below h={h}; check zc and h"
-        ).into());
-    }
-    if n_half == nz {
-        return Err(format!(
-            "no wall-normal point above h={h}; cannot evaluate centreline values"
-        ).into());
-    }
+    let (n_half, t, zc_h) = half_grid(zc, h)?;
     let (i_lo, i_hi) = (n_half - 1, n_half);
-    let t = (h - zc[i_lo]) / (zc[i_hi] - zc[i_lo]);
-
-    let mut zc_h = Array1::<f64>::zeros(n_half + 1);
-    zc_h.slice_mut(s![..n_half]).assign(&zc.slice(s![..n_half]));
-    zc_h[n_half] = h;
 
     let crop = |a: &ArrayD<f64>| crop_extend(a, n_half, t);
 
@@ -439,10 +423,42 @@ fn fik_half_channel(
 
 // ─── Helpers: half-channel cropping and bulk means ───────────────────────────
 
+/// Locate the half-channel split of a full-height grid `zc` at z = h.
+///
+/// Returns `(n_half, t, zc_h)`: rows `[0, n_half)` lie at z ≤ h, `t` is the
+/// linear-interpolation weight between rows `n_half-1` and `n_half` for the
+/// extra row appended exactly at z = h, and `zc_h` is the cropped coordinate
+/// vector of length `n_half + 1` ending at h.  Shared by the FIK and RD
+/// decompositions (see `math/rd.rs`).
+pub(crate) fn half_grid(
+    zc: &Array1<f64>,
+    h: f64,
+) -> Result<(usize, f64, Array1<f64>), Error> {
+    let nz = zc.len();
+    let n_half = zc.iter().position(|&z| z > h).unwrap_or(nz);
+    if n_half < 2 {
+        return Err(format!(
+            "fewer than 2 wall-normal points below h={h}; check zc and h"
+        ).into());
+    }
+    if n_half == nz {
+        return Err(format!(
+            "no wall-normal point above h={h}; cannot evaluate centreline values"
+        ).into());
+    }
+    let (i_lo, i_hi) = (n_half - 1, n_half);
+    let t = (h - zc[i_lo]) / (zc[i_hi] - zc[i_lo]);
+
+    let mut zc_h = Array1::<f64>::zeros(n_half + 1);
+    zc_h.slice_mut(s![..n_half]).assign(&zc.slice(s![..n_half]));
+    zc_h[n_half] = h;
+    Ok((n_half, t, zc_h))
+}
+
 /// Crop a 2-D `(nz, nx)` array to its first `n_half` rows and append one row
 /// linearly interpolated to z = h (weight `t` between original rows
 /// `n_half-1` and `n_half`).
-fn crop_extend(a: &ArrayD<f64>, n_half: usize, t: f64) -> ArrayD<f64> {
+pub(crate) fn crop_extend(a: &ArrayD<f64>, n_half: usize, t: f64) -> ArrayD<f64> {
     let nx = a.shape()[1];
     let mut out = ArrayD::<f64>::zeros(ndarray::IxDyn(&[n_half + 1, nx]));
     for iz in 0..n_half {
@@ -496,7 +512,7 @@ fn subtract_bulk(f: &ArrayD<f64>, fm: &Array1<f64>) -> ArrayD<f64> {
 /// `z`      – wall-normal cell-centre positions, shape (nz,)
 ///
 /// Returns an `Array1<f64>` of length nx.
-fn fik_integrate(
+pub(crate) fn fik_integrate(
     f:      &ArrayD<f64>,
     weight: &Array1<f64>,
     z:      &Array1<f64>,
