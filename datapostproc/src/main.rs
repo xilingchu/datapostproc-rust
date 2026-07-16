@@ -9,6 +9,7 @@ use datapostproc_rust::math::fik::{
 };
 use datapostproc_rust::math::rd::rd_decomposition;
 use datapostproc_rust::math::spectrum::SpanwiseSpectrum;
+use datapostproc_rust::math::vortex::vortex_criteria;
 use datapostproc_rust::math::wall::{friction_velocity, wall_shear_stress};
 use datapostproc_rust::output::dat::write_dat;
 use datapostproc_rust::output::normalize::Profiles;
@@ -41,6 +42,9 @@ enum Command {
     /// Renard–Deck (energy-budget) skin-friction decomposition from a
     /// subavg HDF5 file.
     Rd(RdArgs),
+    /// Q and λ₂ vortex-identification fields from instantaneous snapshots,
+    /// written to an HDF5 file (use `hdfview` to make an XDMF for Paraview).
+    Vortex(VortexArgs),
 }
 
 /// Hyperslab [start stride count block] for output (4 values, HDF5 convention).
@@ -141,6 +145,7 @@ fn main() {
         Command::Spectra(args) => run_spectra(args),
         Command::Fik(args) => run_fik(args),
         Command::Rd(args) => run_rd(args),
+        Command::Vortex(args) => run_vortex(args),
     }
 }
 
@@ -744,6 +749,140 @@ fn run_rd(args: RdArgs) {
     write_dat(Path::new(&args.output), "x", re_b, &cols)
         .expect("failed to write .dat file");
     eprintln!("wrote {}", args.output);
+}
+
+// ─── vortex sub-command ───────────────────────────────────────────────────────
+
+#[derive(Args)]
+struct VortexArgs {
+    /// Instantaneous snapshot HDF5 file containing dataset `u` (streamwise).
+    #[arg(short = 'u', long, value_name = "FILE")]
+    ufile: String,
+    /// Snapshot file containing dataset `v` (spanwise); default: same as --ufile.
+    #[arg(short = 'v', long, value_name = "FILE")]
+    vfile: Option<String>,
+    /// Snapshot file containing dataset `w` (wall-normal); default: same as --ufile.
+    #[arg(short = 'w', long, value_name = "FILE")]
+    wfile: Option<String>,
+    /// Output HDF5 file with q/lambda2/u fields (+ x/y/zc/nu).
+    #[arg(short, long, value_name = "FILE", default_value = "vortex.h5")]
+    output: String,
+    /// Treat streamwise direction as periodic for derivative stencils.
+    #[arg(long, default_value_t = false)]
+    periodic_x: bool,
+}
+
+fn run_vortex(args: VortexArgs) {
+    // ── coordinates / metadata from the u file ───────────────────────────────
+    let mut h5u = H5File::new(&args.ufile).expect("failed to open u file");
+    h5u.get_info().expect("failed to read DNS info");
+    h5u.load_coords().expect("failed to load coordinates");
+
+    let read_coord = |h5: &H5File, name: &str| -> Array1<f64> {
+        match h5
+            .coord(name)
+            .unwrap_or_else(|| panic!("coord '{name}' not found"))
+            .read_data::<f64>()
+            .unwrap()
+        {
+            H5Data::Array(a) => a.into_dimensionality::<Ix1>().unwrap(),
+            H5Data::Scalar(_) => panic!("coord '{name}' is scalar"),
+        }
+    };
+    let x = read_coord(&h5u, "x");
+    let y = read_coord(&h5u, "y");
+    let zc = read_coord(&h5u, "zc");
+    let nu = h5u.info().nu.expect("'nu' not in HDF5 file");
+    let (nxc, ny, nz) = (x.len(), y.len(), zc.len());
+    drop(h5u);
+
+    // Align the field's streamwise extent with the x coordinate array
+    // (same conventions as the spectra sub-command).
+    let align = |raw: ArrayD<f64>| -> ArrayD<f64> {
+        let nxf = raw.shape()[2];
+        match nxf.checked_sub(nxc) {
+            Some(0) => raw,
+            Some(1) => raw.slice_axis(Axis(2), (0..nxc).into()).to_owned(),
+            Some(2) => raw.slice_axis(Axis(2), (1..nxc + 1).into()).to_owned(),
+            _ => panic!("field x extent {nxf} incompatible with x coord length {nxc}"),
+        }
+    };
+    let load_field = |path: &str, name: &str| -> ArrayD<f64> {
+        let mut h5 = H5File::new(path).expect("failed to open HDF5 file");
+        h5.add_dataset(name, None)
+            .unwrap_or_else(|e| panic!("dataset '{name}' in {path}: {e}"));
+        let raw = match h5.dataset(name).unwrap().read_data::<f64>().unwrap() {
+            H5Data::Array(a) => a,
+            H5Data::Scalar(_) => panic!("'{name}' is scalar"),
+        };
+        align(raw)
+    };
+
+    let u = load_field(&args.ufile, "u");
+    let v = load_field(args.vfile.as_deref().unwrap_or(&args.ufile), "v");
+    let w = load_field(args.wfile.as_deref().unwrap_or(&args.ufile), "w");
+    eprintln!("fields loaded: ({nz}, {ny}, {nxc})");
+
+    // ── Q and λ₂ ──────────────────────────────────────────────────────────────
+    let vf = vortex_criteria(&u, &v, &w, &x, &y, &zc, [false, true, args.periodic_x])
+        .expect("vortex_criteria failed");
+    drop(v);
+    drop(w);
+    eprintln!("Q and λ₂ computed");
+
+    // ── isosurface-level guidance: tail quantiles ─────────────────────────────
+    let quantiles = |field: &ArrayD<f64>, fractions: &[f64], lower_tail: bool| -> Vec<f64> {
+        let mut sample: Vec<f64> = field.as_slice().unwrap().iter().step_by(16).copied().collect();
+        sample.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        fractions
+            .iter()
+            .map(|&f| {
+                let frac = if lower_tail { f } else { 1.0 - f };
+                sample[((sample.len() - 1) as f64 * frac) as usize]
+            })
+            .collect()
+    };
+    let fr = [0.001, 0.005, 0.01, 0.02, 0.05];
+    let l2q = quantiles(&vf.lambda2, &fr, true);
+    let qq = quantiles(&vf.q, &fr, false);
+    eprintln!("suggested isosurface levels (tail quantiles of the sampled field):");
+    for (i, f) in fr.iter().enumerate() {
+        eprintln!(
+            "  {:>5.1}%:  lambda2 = {:>12.4e}    q = {:>12.4e}",
+            f * 100.0,
+            l2q[i],
+            qq[i]
+        );
+    }
+
+    // ── write HDF5 (q, lambda2, u + coords/metadata) ──────────────────────────
+    let out = hdf5::File::create(&args.output).expect("failed to create output HDF5");
+    let write3d = |name: &str, a: &ArrayD<f64>| {
+        out.new_dataset_builder()
+            .with_data(a.view())
+            .create(name)
+            .unwrap_or_else(|e| panic!("write '{name}': {e}"));
+    };
+    write3d("q", &vf.q);
+    write3d("lambda2", &vf.lambda2);
+    write3d("u", &u);
+    let write1d = |name: &str, a: &Array1<f64>| {
+        out.new_dataset_builder()
+            .with_data(a.view())
+            .create(name)
+            .unwrap_or_else(|e| panic!("write '{name}': {e}"));
+    };
+    write1d("x", &x);
+    write1d("y", &y);
+    write1d("zc", &zc);
+    write1d("nu", &Array1::from_elem(1, nu));
+    drop(out);
+    eprintln!("wrote {}", args.output);
+    eprintln!(
+        "to view in Paraview, generate an XDMF for the region of interest, e.g.:\n  \
+         datapostproc-rust hdfview -f {} -v q lambda2 u",
+        args.output
+    );
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
