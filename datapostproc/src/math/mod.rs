@@ -4,5 +4,6 @@ pub mod fik;
 pub mod ns;
 pub mod rd;
 pub mod spectrum;
+pub mod tke;
 pub mod vortex;
 pub mod wall;
