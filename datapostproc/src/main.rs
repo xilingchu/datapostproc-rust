@@ -9,7 +9,7 @@ use datapostproc_rust::math::fik::{
 };
 use datapostproc_rust::math::rd::{rd_decomposition, RdDecomposition};
 use datapostproc_rust::math::spectrum::SpanwiseSpectrum;
-use datapostproc_rust::math::tke::{tke_fields, TkeFields};
+use datapostproc_rust::math::tke::{stress_budget, tke_fields, BudgetTerms, TkeFields};
 use datapostproc_rust::math::vortex::vortex_criteria;
 use datapostproc_rust::math::wall::{friction_velocity, wall_shear_stress};
 use datapostproc_rust::output::dat::write_dat;
@@ -1206,6 +1206,13 @@ struct TkeArgs {
     /// `<output stem>_x<pos>.dat` per station instead.
     #[arg(short, long, value_name = "FILE", default_value = "tke.dat")]
     output: String,
+    /// Budget mode: full transport budget of the given component(s)
+    /// (uu, vv, ww, uv, uw, vw, or tke = half-trace), comma-separated.
+    /// Each file gets columns stress/prod/turb_trans/visc_trans/press_strain/
+    /// press_trans/visc_diss/conv/balance; several components write one file
+    /// `<stem>_<comp>.dat` each.  Without this flag: the plain stress profiles.
+    #[arg(long, value_delimiter = ',')]
+    component: Option<Vec<String>>,
     /// Physical x locations for wall-normal profiles, comma-separated; each is
     /// snapped to the nearest grid point and written to its own file.
     #[arg(long, value_delimiter = ',')]
@@ -1214,6 +1221,10 @@ struct TkeArgs {
     /// over when --xloc is not given; default: full streamwise extent.
     #[arg(long, num_args = 2, value_name = "INT")]
     xrange: Option<Vec<usize>>,
+    /// Treat streamwise direction as periodic for derivative stencils
+    /// (budget mode only).
+    #[arg(long, default_value_t = false)]
+    periodic_x: bool,
 }
 
 fn run_tke(args: TkeArgs) {
@@ -1232,6 +1243,7 @@ fn run_tke(args: TkeArgs) {
         }
     };
     let x  = load_coord(&h5, "x");
+    let y  = load_coord(&h5, "y");
     let zc = load_coord(&h5, "zc");
     let nxc = x.len();
     drop(h5);
@@ -1239,6 +1251,56 @@ fn run_tke(args: TkeArgs) {
     // read_inst_field's alignment also covers the subavg ghost convention
     // (nx + 2 → strip one column each side).
     let load = |name: &str| read_inst_field(&args.file, name, nxc);
+
+    if let Some(comps) = &args.component {
+        // ── budget mode: transport budget per requested component ────────────
+        let mut loader = |name: &str| -> Result<ArrayD<f64>, hdf5::Error> {
+            Ok(read_inst_field(&args.file, name, nxc))
+        };
+        let mut budget_of = |comp: &str| -> BudgetTerms {
+            let (i, j) = match comp {
+                "uu" => (0, 0), "vv" => (1, 1), "ww" => (2, 2),
+                "uv" => (0, 1), "uw" => (0, 2), "vw" => (1, 2),
+                other => panic!(
+                    "unknown component '{other}' (use uu/vv/ww/uv/uw/vw/tke)"
+                ),
+            };
+            stress_budget(&mut loader, i, j, &x, &y, &zc, nu, args.periodic_x)
+                .unwrap_or_else(|e| panic!("budget for '{comp}' failed: {e}"))
+        };
+
+        let single = comps.len() == 1;
+        let stem = args.output.strip_suffix(".dat").unwrap_or(&args.output).to_string();
+        for comp in comps {
+            let b = if comp == "tke" {
+                // k-budget = half the trace of the diagonal budgets
+                budget_of("uu").axpy(1.0, &budget_of("vv")).axpy(1.0, &budget_of("ww")).scale(0.5)
+            } else {
+                budget_of(comp)
+            };
+            let balance = b.balance();
+            let fields: Vec<(&str, &ArrayD<f64>)> = vec![
+                (comp.as_str(), &b.stress),
+                ("prod", &b.prod),
+                ("turb_trans", &b.turb_trans),
+                ("visc_trans", &b.visc_trans),
+                ("press_strain", &b.press_strain),
+                ("press_trans", &b.press_trans),
+                ("visc_diss", &b.visc_diss),
+                ("conv", &b.conv),
+                ("balance", &balance),
+            ];
+            let path = if single {
+                args.output.clone()
+            } else {
+                format!("{stem}_{comp}.dat")
+            };
+            write_profile_outputs(&fields, &x, &zc, 1.0 / nu, &args.xloc, &args.xrange, &path);
+        }
+        return;
+    }
+
+    // ── plain stress-profile mode ─────────────────────────────────────────────
     let u  = load("u");
     let v  = load("v");
     let w  = load("w");
@@ -1385,16 +1447,31 @@ fn write_tke_outputs(
     xrange: &Option<Vec<usize>>,
     output: &str,
 ) {
-    let nx = x.len();
     let fields: [(&str, &ArrayD<f64>); 7] = [
         ("uu", &tf.uu), ("vv", &tf.vv), ("ww", &tf.ww),
         ("uv", &tf.uv), ("uw", &tf.uw), ("vw", &tf.vw),
         ("tke", &tf.tke),
     ];
+    write_profile_outputs(&fields, x, zc, ret, xloc, xrange, output);
+}
+
+/// Write named `(nz, nx)` fields as wall-normal profiles to .dat file(s),
+/// selecting stations with `xloc` or averaging over `xrange` like
+/// [`write_tke_outputs`].
+fn write_profile_outputs(
+    fields: &[(&str, &ArrayD<f64>)],
+    x:  &Array1<f64>,
+    zc: &Array1<f64>,
+    ret: f64,
+    xloc: &Option<Vec<f64>>,
+    xrange: &Option<Vec<usize>>,
+    output: &str,
+) {
+    let nx = x.len();
     let write = |profile: &dyn Fn(&ArrayD<f64>) -> Array1<f64>, path: &str| {
         let mut cols: HashMap<String, Array1<f64>> = HashMap::new();
         cols.insert("zc".into(), zc.clone());
-        for (name, f) in &fields {
+        for (name, f) in fields {
             cols.insert((*name).into(), profile(f));
         }
         write_dat(Path::new(path), "zc", ret, &cols)
